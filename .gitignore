@@ -1,0 +1,8 @@
+target/
+*.flit/
+__pycache__/
+*.pyc
+.venv/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/

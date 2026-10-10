@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xcb-icccm
+Description: shim for xcb-icccm (runtime lib only; headers not needed by Rust)
+Version: 0.4.1
+Requires: xcb
+Libs: -L${libdir} -lxcb-icccm
+Cflags: -I${includedir}

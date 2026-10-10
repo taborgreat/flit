@@ -1,0 +1,51 @@
+[package]
+name = "flit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flit-core = { path = "../crates/flit-core" }
+flit-audio = { path = "../crates/flit-audio" }
+flit-ipc = { path = "../crates/flit-ipc" }
+flit-bridge-fl = { path = "../bridges/fl" }
+serde_json = "1"
+
+[[bin]]
+name = "stamp_decode"
+path = "fuzz_targets/stamp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_decode"
+path = "fuzz_targets/chunk_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_state"
+path = "fuzz_targets/host_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_decode"
+path = "fuzz_targets/ipc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sysex_decode"
+path = "fuzz_targets/sysex_decode.rs"
+test = false
+doc = false
+bench = false

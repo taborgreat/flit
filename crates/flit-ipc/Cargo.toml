@@ -1,0 +1,19 @@
+[package]
+name = "flit-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+flit-core.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+interprocess.workspace = true
+tokio.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

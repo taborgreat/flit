@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xrender
+Description: shim for xrender (runtime lib only; headers not needed by Rust)
+Version: 0.9.10
+Requires: x11
+Libs: -L${libdir} -lXrender
+Cflags: -I${includedir}

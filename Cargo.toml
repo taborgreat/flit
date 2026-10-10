@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/flit-core",
+    "crates/flit-host",
+    "crates/flit-net",
+    "crates/flit-audio",
+    "crates/flit-ipc",
+    "crates/flit-agent",
+    "crates/flit-plugin",
+    "bridges/fake",
+    "bridges/fl",
+    "tools/fake-session",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Tabor Holly"]
+
+[workspace.dependencies]
+flit-core = { path = "crates/flit-core" }
+flit-host = { path = "crates/flit-host" }
+flit-net = { path = "crates/flit-net" }
+flit-audio = { path = "crates/flit-audio" }
+flit-ipc = { path = "crates/flit-ipc" }
+flit-bridge-fake = { path = "bridges/fake" }
+flit-bridge-fl = { path = "bridges/fl" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+blake3 = "1"
+ed25519-dalek = { version = "3", features = ["rand_core", "serde"] }
+rand = "0.10"
+thiserror = "2"
+anyhow = "1"
+hex = "0.4"
+data-encoding = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+iroh = "1.3"
+futures-lite = "2"
+bytes = "1"
+tempfile = "3"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+opusic-c = "1.6"
+flacenc = { version = "0.5", default-features = false }
+claxon = "0.4"
+rtrb = "0.3"
+atomic_float = "1"
+qrcode = { version = "0.14", default-features = false }
+arboard = { version = "3", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+interprocess = { version = "2", features = ["tokio"] }
+keyring = { version = "4", default-features = false }
+dirs = "6"
+clap = { version = "4", features = ["derive"] }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+# Same rev nih_plug_egui uses. Verified on FL 24.1.1: without the feature the
+# plugin window never takes keyboard focus (FL keeps the keys), so nothing
+# can be typed into the panel. The feature focuses the window whenever egui
+# wants keyboard input (BillyDM/egui-baseview#20).
+egui-baseview = { git = "https://github.com/BillyDM/egui-baseview.git", rev = "ec70c3fe6b2f070dcacbc22924431edbe24bd1c0", features = ["windows_keyboard_workaround"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# Debug builds run every test; unoptimized ed25519/BLAKE3 make each stamp
+# cost milliseconds. Optimize just the crypto crates in dev/test builds.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

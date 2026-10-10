@@ -1,0 +1,26 @@
+[package]
+name = "flit-bridge-fl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+flit-core.workspace = true
+flit-host.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+data-encoding.workspace = true
+dirs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+midir = "0.10"
+# FL's recent-files list (HKCU\Software\Image-Line\FL Studio N\MRU): the only
+# way to learn the open project's path, which the scripting API hides.
+winreg = "0.55"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,14 @@
+[alias]
+xtask = "run --package xtask --release --"
+
+[env]
+# Linux without X11 -dev packages: see tools/linux-shim/README.md
+PKG_CONFIG_PATH = { value = "tools/linux-shim/pkgconfig", relative = true }
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+# iroh declares a cdylib crate type with no exported symbols; GNU ld then
+# auto-exports every symbol and a debug build overflows the 65535-ordinal
+# limit ("export ordinal too large"). Only auto-export is disabled: the
+# plugin's VST3/CLAP entry points come from rustc's .def file and still export.
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

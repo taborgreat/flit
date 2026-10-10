@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xcursor
+Description: shim for xcursor (runtime lib only; headers not needed by Rust)
+Version: 1.2.1
+Requires: x11
+Libs: -L${libdir} -lXcursor
+Cflags: -I${includedir}

@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: x11-xcb
+Description: shim for x11-xcb (runtime lib only; headers not needed by Rust)
+Version: 1.8.7
+Requires: x11 xcb
+Libs: -L${libdir} -lX11-xcb
+Cflags: -I${includedir}

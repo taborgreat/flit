@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xcb-xfixes
+Description: shim for xcb-xfixes (runtime lib only; headers not needed by Rust)
+Version: 1.15
+Requires: xcb
+Libs: -L${libdir} -lxcb-xfixes
+Cflags: -I${includedir}

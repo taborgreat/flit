@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xext
+Description: shim for xext (runtime lib only; headers not needed by Rust)
+Version: 1.3.4
+Requires: x11
+Libs: -L${libdir} -lXext
+Cflags: -I${includedir}

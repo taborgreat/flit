@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xcb-render
+Description: shim for xcb-render (runtime lib only; headers not needed by Rust)
+Version: 1.15
+Requires: xcb
+Libs: -L${libdir} -lxcb-render
+Cflags: -I${includedir}

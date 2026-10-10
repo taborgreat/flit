@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xcb-shape
+Description: shim for xcb-shape (runtime lib only; headers not needed by Rust)
+Version: 1.15
+Requires: xcb
+Libs: -L${libdir} -lxcb-shape
+Cflags: -I${includedir}

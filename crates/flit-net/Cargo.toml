@@ -1,0 +1,29 @@
+[package]
+name = "flit-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+flit-core.workspace = true
+flit-audio.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+serde.workspace = true
+postcard.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+data-encoding.workspace = true
+dirs.workspace = true
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+keyring = { version = "4", default-features = false, features = ["v1"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+flit-host.workspace = true
+flit-bridge-fake.workspace = true

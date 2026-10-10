@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xkbcommon
+Description: shim for xkbcommon (runtime lib only; headers not needed by Rust)
+Version: 1.6.0
+Requires: 
+Libs: -L${libdir} -lxkbcommon
+Cflags: -I${includedir}

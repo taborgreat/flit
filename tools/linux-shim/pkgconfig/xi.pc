@@ -1,0 +1,9 @@
+prefix=/usr
+libdir=${pcfiledir}/../lib
+includedir=/usr/include
+Name: xi
+Description: shim for xi (runtime lib only; headers not needed by Rust)
+Version: 1.8
+Requires: x11
+Libs: -L${libdir} -lXi
+Cflags: -I${includedir}
