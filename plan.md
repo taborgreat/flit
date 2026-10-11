@@ -2,6 +2,10 @@
 
 Author: Tabor Holly - 2026-10-09
 
+> **Superseded in part.** `FLIT_SPEC.md` (the UPDATE PACK as applied) wins wherever it disagrees with this
+> file: lanes, lane owners, lines/branches, Bring in and the single-signature stamp are gone. This file stays
+> as the original brief and the session phases. What was built: `HANDOFF.md`.
+
 ## READ FIRST: how this gets built
 
 Two Claude Code sessions, two machines.
@@ -53,42 +57,37 @@ no port forwarding.
 
 - One installer, one thing to open (the FLit plugin in your DAW).
 - The DAW stays the instrument. FLit watches it and responds.
-- Plain words for users: ID, Song, Crew, Save version, Go back, Try an
-  idea, Bring in. Never repo/commit/branch/key in the UI.
+- Plain words for users: the table in FLIT_SPEC.md section 0 (Studio,
+  member, moment, song, album, org, history, track, crew). Never
+  repo/commit/branch/key in the UI.
 - Send the cheapest thing that sounds right: a setting if the peer can
   reproduce it, a live audio stream if not, full-quality files on save.
 - Audio is the universal language. Anything one DAW can't reproduce from
   another arrives as audio. Mixed-DAW crews always work.
 - Nothing is overwritten. History only grows.
-- One owner per lane.
-- Everything is an event. If a feature can't be events on the log, it
-  doesn't go in.
+- Everything is a moment. If a feature can't be acts and facts on the
+  chains, it doesn't go in.
 - Core is DAW-neutral. Anything DAW-specific lives in that DAW's bridge.
 
 ## Words
 
-- ID: user's public key, shown as short code + QR. Safe to share.
-- Song: the shared work = every lane + full history. Every crew member
-  holds a complete copy. No master copy.
-- Song code: song's public ID. Lets someone ASK to join, never lets them in.
-- Crew: IDs allowed in a song, signed into its history. Humans or AIs.
-- Owner: song creator. Approves/removes crew, can promote other owners.
-- Host: the DAW a crew member is using (FL, Ableton, Logic, Reaper...).
-- Bridge: the per-DAW adapter between a host and the FLit core.
-- Save version: named checkpoint (commit).
-- Main: the default branch. Branch: a separate line of work forked from any
-  moment (was "line"/"idea" in earlier drafts; code and UI say branch now,
-  2026-10-10).
-- Bring in: take a lane from an idea OR from another song you're in into
-  this one. One operation for both merge and pull.
-- Lane: one part (drums, vocals). One owner per lane per line. A lane is
-  edited in its owner's host and heard by everyone in theirs.
-- Recipe: plugin source + lockfile stored in the song so all can build it.
-- Assist: AI acting AS a user, under the user's ID.
-- Partner: AI acting as ITSELF, own ID, own DAW session, approved as crew.
-- Chat: text messages in the song. Logged, so they live in History.
-- Talk: live audio between people that is NOT part of the song (voice, or
-  any mixer track sent to someone). Not logged unless someone records it.
+The vocabulary lives in ONE place: FLIT_SPEC.md section 0 (code names,
+the user-facing table, the dead-word list). Do not restate it anywhere
+else; read it before writing UI text or docs. Short form:
+
+- Users see: Studio (code: Name), member (code: Being), moment (code: Act
+  and Fact), song, album, org, history, track, crew, keeper, Merge,
+  Timeline, Save version, Go back.
+- Dead, never use again: ID, line, idea, branch, lane, lane owner, mix
+  lane, Bring in, Try an idea, offer to owner, Assist, Partner, event.
+- Still current: Song code (lets someone ask to join, never lets them in),
+  Owner (song creator; approves and removes crew), Host (the DAW a member
+  uses), Bridge (the per-DAW adapter), Recipe (plugin source + lockfile
+  stored in the song), Chat (in the song, kept as moments), Talk (live
+  audio outside the song, not kept unless recorded).
+
+Older sections of this file still use dead words in places; FLIT_SPEC.md
+wins wherever they disagree.
 
 ## Hosts and bridges (keep the core general)
 

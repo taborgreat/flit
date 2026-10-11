@@ -1,7 +1,12 @@
 //! Wire messages. Everything is postcard, length-prefixed (u32 LE).
+//!
+//! Two verbs carry a song between machines (FLIT_SPEC §21): ACT (a
+//! being's signed act, live and optimistic) and MOMENT (the keeper's
+//! sealed fact with its act). Catching up is "moments after head X" per
+//! history, then acts after each being's act head.
 
-use flit_core::{Stamp, StampId, Hash, Id, Signature, SongId};
 use flit_audio::StreamPacket;
+use flit_core::{Act, ActId, BeingRef, Fact, Hash, HistoryId, Id, Signature, SongId};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -84,20 +89,33 @@ impl JoinRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum JoinReply {
-    /// Approved: here is the song to start from.
-    Welcome { name: String, genesis: Stamp, peers: Vec<AddrInfo> },
+    /// Approved: here is the song to start from (its genesis moment).
+    Welcome { name: String, genesis: Act, genesis_fact: Option<Fact>, peers: Vec<AddrInfo> },
     /// Owner will decide later; ask again (or wait for them to add you).
     Pending,
     Refused(String),
 }
 
+/// Where a peer's copy stands: per being per history act counts, and per
+/// history seal counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Heads {
+    pub acts: Vec<(BeingRef, HistoryId, u64)>,
+    pub seals: Vec<(HistoryId, u64)>,
+}
+
 /// Sync session messages (both directions).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SyncMsg {
-    Hello { song: SongId, ids: Vec<StampId>, addr: AddrInfo, peers: Vec<AddrInfo> },
-    Stamps(Vec<Stamp>),
-    Want(Vec<StampId>),
-    /// Asks the peer for blobs it likely has (owner of the events).
+    Hello { song: SongId, heads: Heads, addr: AddrInfo, peers: Vec<AddrInfo> },
+    /// ACT: a being's signed act (live, optimistic).
+    Act(Act),
+    /// MOMENT: the keeper's sealed fact with its act.
+    Moment(Act, Fact),
+    /// Acts I am missing (an act_prev I do not have).
+    Want(Vec<ActId>),
+    /// Send me everything after these heads.
+    After(Heads),
     Bye,
 }
 

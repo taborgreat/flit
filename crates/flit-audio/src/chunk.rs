@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(opus.len(), 3);
         assert_eq!(flac.len(), 3);
         assert_ne!(opus[0], flac[0]);
-        let clip = flit_core::AudioClip { start: flit_core::SongPos::START, sample_rate: 48_000, bit_depth: 24, channels: 2, print_point: Default::default(), opus_chunks: opus.clone(), flac_chunks: flac.clone(), credit: None, stamp: Hash::ZERO };
+        let clip = flit_core::AudioClip { start: flit_core::SongPos::START, sample_rate: 48_000, bit_depth: 24, channels: 2, print_point: Default::default(), opus_chunks: opus.clone(), flac_chunks: flac.clone(), credit: None, act: Hash::ZERO };
         let full = load_clip(&store, &clip).unwrap().unwrap();
         assert_eq!(full.samples.len(), audio.samples.len());
         assert!(rms_diff(&full.samples, &audio.samples) < 1e-6, "flac path is lossless");

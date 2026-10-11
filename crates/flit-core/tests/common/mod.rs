@@ -76,6 +76,14 @@ impl Net {
         &mut self.songs[i]
     }
 
+    /// A late peer joins the wire.
+    pub fn add(&mut self, song: Song) -> usize {
+        self.songs.push(song);
+        self.offline.push(false);
+        self.queued.push(Vec::new());
+        self.songs.len() - 1
+    }
+
     fn collect(&mut self) {
         for i in 0..self.songs.len() {
             let out = self.songs[i].take_outbox();

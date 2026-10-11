@@ -73,6 +73,8 @@ struct SongMeta {
     /// and warn when another project file is opened in that folder.
     #[serde(default)]
     project: Option<String>,
+    #[serde(default)]
+    kind: crate::org::ContainerKind,
     #[serde(default = "default_format")]
     format: u32,
 }
@@ -168,23 +170,58 @@ impl Song {
     /// Create a new song in `dir` (the `.flit` folder). The creator's Name
     /// becomes the first owner and this machine the keeper.
     pub fn create(dir: impl AsRef<Path>, who: &Stamper, name: &str, now_ms: u64) -> crate::Result<Song> {
+        Self::create_kind(dir, who, name, crate::org::ContainerKind::Song, now_ms)
+    }
+
+    /// Create a container of any kind: a song, an org (PACK 2 §1) or a
+    /// Name's personal shelf (§2). The kind is in the genesis act.
+    pub fn create_kind(dir: impl AsRef<Path>, who: &Stamper, name: &str, kind: crate::org::ContainerKind, now_ms: u64) -> crate::Result<Song> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+        // A folder from before the spine model (dev-only data) is moved
+        // aside, never deleted, and the new song takes its place.
         if Spines::old_layout(&dir) {
-            return Err(crate::Error::Invalid(format!("{} is a song from before the spine model; it cannot be opened", dir.display())));
+            let aside = Self::aside_name(&dir);
+            std::fs::rename(&dir, &aside)?;
+            eprintln!("flit: moved the old song folder aside to {}", aside.display());
         }
+        std::fs::create_dir_all(&dir)?;
         let chains = Chains::open(&dir)?;
         if !chains.is_empty() {
             return Err(crate::Error::Invalid(format!("{} already holds a song", dir.display())));
         }
         let blobs = BlobStore::open(dir.join("blobs"))?;
-        let meta = SongMeta { id: Hash::ZERO, name: name.to_string(), project: None, format: FORMAT_VERSION };
+        let meta = SongMeta { id: Hash::ZERO, name: name.to_string(), project: None, kind, format: FORMAT_VERSION };
         let mut song = Song { dir, chains, blobs, meta, keeper: Some(who.keeper_key()), outbox: Vec::new(), notices: Vec::new() };
-        let genesis = song.act(who, main_history(), Thing::Song, Payload::Crew(CrewAction::Approve { id: who.name, owner: true }), None, now_ms)?;
+        let genesis = song.act_inner(who, main_history(), Thing::Song, Payload::Crew(CrewAction::Approve { id: who.name, owner: true }), None, now_ms, kind.genesis_property())?;
         song.meta.id = genesis.id;
         song.write_meta()?;
         song.act(who, main_history(), Thing::SongSettings, Payload::Keeper(KeeperPayload { name: who.name, machine: who.machine.clone() }), None, now_ms)?;
+        if kind == crate::org::ContainerKind::Org {
+            song.act(who, main_history(), Thing::SongSettings, Payload::Settings(SettingsChange::Label(name.to_string())), None, now_ms)?;
+        }
         Ok(song)
+    }
+
+    pub fn kind(&self) -> crate::org::ContainerKind {
+        self.chains.kind()
+    }
+
+    /// The org this song belongs to and who may act in it.
+    pub fn org(&self) -> Option<Hash> {
+        self.main().settings.org
+    }
+    pub fn access(&self) -> crate::org::Access {
+        self.main().settings.access
+    }
+
+    /// Songs with access = org: tell the chains who the org's members are.
+    pub fn set_org_members(&mut self, members: Option<std::collections::BTreeSet<Id>>) {
+        self.chains.set_org_members(members);
+    }
+
+    /// The albums of an org or personal shelf.
+    pub fn albums(&self) -> &crate::org::Albums {
+        &self.main().albums
     }
 
     /// Open an existing song folder. The keeper key, if this machine holds
@@ -217,7 +254,8 @@ impl Song {
         } else if chains.song_id() != Some(genesis.id) {
             return Err(crate::Error::Invalid("folder holds a different song".into()));
         }
-        let meta = SongMeta { id: genesis.id, name: name.to_string(), project: None, format: FORMAT_VERSION };
+        let kind = crate::org::ContainerKind::from_genesis_property(genesis.body.property.as_deref()).unwrap_or_default();
+        let meta = SongMeta { id: genesis.id, name: name.to_string(), project: None, kind, format: FORMAT_VERSION };
         std::fs::write(dir.join("song.json"), serde_json::to_string_pretty(&meta).unwrap())?;
         let blobs = BlobStore::open(dir.join("blobs"))?;
         Ok(Song { dir, chains, blobs, meta, keeper: None, outbox: Vec::new(), notices: Vec::new() })
@@ -229,7 +267,23 @@ impl Song {
     }
 
     pub fn exists(dir: impl AsRef<Path>) -> bool {
-        dir.as_ref().join("song.json").is_file()
+        let dir = dir.as_ref();
+        dir.join("song.json").is_file() && !Spines::old_layout(dir)
+    }
+
+    /// `<dir>-before-spines`, `-2`, `-3`, ... whichever does not exist yet.
+    fn aside_name(dir: &Path) -> PathBuf {
+        let base = format!("{}-before-spines", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ".flit".into()));
+        let parent = dir.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut n = 1;
+        loop {
+            let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+            let p = parent.join(name);
+            if !p.exists() {
+                return p;
+            }
+            n += 1;
+        }
     }
 
     /// The project file (name only) this song belongs to, if recorded.
@@ -317,6 +371,8 @@ impl Song {
             match d {
                 Decision::Sealed(f) => {
                     if let Some(a) = self.chains.get(&f.act_id()) {
+                        // an own act still queued as a bare ACT travels as the moment instead
+                        self.outbox.retain(|o| !matches!(o, Outbound::Act(x) if x.id == a.id));
                         self.outbox.push(Outbound::Moment(a.clone(), f.clone()));
                     }
                 }
@@ -325,6 +381,7 @@ impl Song {
                         self.outbox.push(Outbound::Moment(a.clone(), f.clone()));
                     }
                     if let Some(a) = self.chains.get(&fact.act_id()).cloned() {
+                        self.outbox.retain(|o| !matches!(o, Outbound::Act(x) if x.id == a.id));
                         self.outbox.push(Outbound::Moment(a.clone(), fact.clone()));
                         self.notices.push(Notice::Declined {
                             act: a.id,
@@ -362,7 +419,7 @@ impl Song {
     /// An act that arrived from a peer (verified on the way in; applied
     /// optimistically; sealed at once if this machine is the keeper).
     pub fn import_act(&mut self, act: Act, now_ms: u64) -> crate::Result<AppendOutcome> {
-        let outcome = self.chains.append_act(act, Some(now_ms))?;
+        let outcome = self.chains.import_act(act, Some(now_ms))?;
         if outcome == AppendOutcome::Equivocation {
             if let Some(ev) = self.chains.evidence().last() {
                 self.notices.push(Notice::Equivocation { being: ev.being.clone(), acts: ev.acts });
@@ -394,13 +451,27 @@ impl Song {
         Ok(outcome)
     }
 
-    /// A MOMENT: fact with its act.
+    /// A MOMENT: fact with its act. A fact whose act still waits for its
+    /// prev waits with it.
     pub fn import_moment(&mut self, act: Act, fact: Fact, now_ms: u64) -> crate::Result<AppendOutcome> {
-        let a = self.import_act(act, now_ms)?;
-        if a == AppendOutcome::Pending || a == AppendOutcome::Equivocation {
-            return Ok(a);
+        let gate = fact.body.gate;
+        let act_id = fact.act_id();
+        let history = fact.history();
+        let outcome = self.chains.append_moment(act, fact, Some(now_ms))?;
+        if outcome == AppendOutcome::Equivocation {
+            if let Some(ev) = self.chains.evidence().last() {
+                self.notices.push(Notice::Equivocation { being: ev.being.clone(), acts: ev.acts });
+            }
         }
-        self.import_fact(fact)
+        if outcome == AppendOutcome::Appended {
+            if gate {
+                if let Some(a) = self.chains.get(&act_id) {
+                    self.notices.push(Notice::Declined { act: act_id, being: a.being(), history, history_name: self.chains.history_name(&history).unwrap_or("").to_string(), property: lens::property_label(a) });
+                }
+            }
+            self.seal_pending(now_ms)?;
+        }
+        Ok(outcome)
     }
 
     // ----- stamping -----
@@ -410,6 +481,12 @@ impl Song {
     /// keeper. An ai / scripted being without a grant for the track lands
     /// in its own history instead.
     pub fn act(&mut self, who: &Stamper, history: HistoryId, thing: Thing, payload: Payload, pos: Option<SongPos>, now_ms: u64) -> crate::Result<Act> {
+        let property = payload.property();
+        self.act_inner(who, history, thing, payload, pos, now_ms, property)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn act_inner(&mut self, who: &Stamper, history: HistoryId, thing: Thing, payload: Payload, pos: Option<SongPos>, now_ms: u64, property: Option<String>) -> crate::Result<Act> {
         let being = who.being_ref();
         let history = self.route(who, history, &thing, &payload, now_ms)?;
         let (act_prev, act_seq) = self.chains.act_head(&being, &history).map(|(id, n)| (Some(id), n + 1)).unwrap_or((None, 1));
@@ -422,7 +499,7 @@ impl Song {
             being: who.being.clone(),
             act_prev,
             act_seq,
-            property: payload.property(),
+            property,
             thing,
             based_on,
             history,
@@ -561,6 +638,57 @@ impl Song {
         self.on_song(who, main_history(), Payload::Crew(CrewAction::UnblockBeing { being }), now_ms)
     }
     /// An owner settles an equivocation: the keeper seals the being again.
+    // ----- orgs (PACK 2 §1) -----
+
+    pub fn invite(&mut self, who: &Stamper, id: Id, now_ms: u64) -> crate::Result<Act> {
+        self.on_song(who, main_history(), Payload::Crew(CrewAction::Invite { id }), now_ms)
+    }
+    pub fn accept(&mut self, who: &Stamper, now_ms: u64) -> crate::Result<Act> {
+        self.on_song(who, main_history(), Payload::Crew(CrewAction::Accept), now_ms)
+    }
+    pub fn decline(&mut self, who: &Stamper, now_ms: u64) -> crate::Result<Act> {
+        self.on_song(who, main_history(), Payload::Crew(CrewAction::Decline), now_ms)
+    }
+    pub fn leave(&mut self, who: &Stamper, now_ms: u64) -> crate::Result<Act> {
+        self.on_song(who, main_history(), Payload::Crew(CrewAction::Leave), now_ms)
+    }
+    pub fn demote(&mut self, who: &Stamper, id: Id, now_ms: u64) -> crate::Result<Act> {
+        self.on_song(who, main_history(), Payload::Crew(CrewAction::Demote { id }), now_ms)
+    }
+    /// Song: move it into (or out of) an org and set who may act in it.
+    pub fn set_org(&mut self, who: &Stamper, org: Option<Hash>, access: crate::org::Access, now_ms: u64) -> crate::Result<Act> {
+        self.on_settings(who, main_history(), Payload::Settings(SettingsChange::Org { org, access }), now_ms)
+    }
+    pub fn set_ai_policy(&mut self, who: &Stamper, policy: crate::org::AiPolicy, now_ms: u64) -> crate::Result<Act> {
+        self.on_settings(who, main_history(), Payload::Settings(SettingsChange::AiPolicy(policy)), now_ms)
+    }
+    /// Org: name, color, defaults, archive.
+    pub fn set_label(&mut self, who: &Stamper, label: &str, now_ms: u64) -> crate::Result<Act> {
+        let act = self.on_settings(who, main_history(), Payload::Settings(SettingsChange::Label(label.to_string())), now_ms)?;
+        self.meta.name = label.to_string();
+        self.write_meta()?;
+        Ok(act)
+    }
+    pub fn set_color(&mut self, who: &Stamper, color: u32, now_ms: u64) -> crate::Result<Act> {
+        self.on_settings(who, main_history(), Payload::Settings(SettingsChange::Color(color)), now_ms)
+    }
+    pub fn set_defaults(&mut self, who: &Stamper, defaults: crate::org::OrgDefaults, now_ms: u64) -> crate::Result<Act> {
+        self.on_settings(who, main_history(), Payload::Settings(SettingsChange::Defaults(defaults)), now_ms)
+    }
+    pub fn set_archived(&mut self, who: &Stamper, archived: bool, now_ms: u64) -> crate::Result<Act> {
+        self.on_settings(who, main_history(), Payload::Settings(SettingsChange::Archived(archived)), now_ms)
+    }
+
+    // ----- albums (PACK 2 §2) -----
+
+    /// A new album; its id is the act's.
+    pub fn create_album(&mut self, who: &Stamper, name: &str, now_ms: u64) -> crate::Result<crate::org::AlbumId> {
+        Ok(self.on_song(who, main_history(), Payload::Album(crate::org::AlbumAction::Create { name: name.to_string() }), now_ms)?.id)
+    }
+    pub fn album(&mut self, who: &Stamper, album: crate::org::AlbumId, action: crate::org::AlbumAction, now_ms: u64) -> crate::Result<Act> {
+        self.act(who, main_history(), Thing::Album(album), Payload::Album(action), None, now_ms)
+    }
+
     pub fn pardon(&mut self, who: &Stamper, being: BeingRef, now_ms: u64) -> crate::Result<Act> {
         self.on_song(who, main_history(), Payload::Crew(CrewAction::Pardon { being }), now_ms)
     }

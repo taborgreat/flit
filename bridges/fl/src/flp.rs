@@ -2,7 +2,7 @@
 //! (PyFLP, GPL-3, kept in its own process and never linked). The helper
 //! prints host-neutral JSON; this module turns it into a `ProjectSnapshot`.
 
-use flit_core::{LaneId, Note, SongPos, TICKS_PER_BEAT};
+use flit_core::{Note, SongPos, TrackId, TICKS_PER_BEAT};
 use flit_host::ProjectSnapshot;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -127,13 +127,13 @@ fn ticks(fl: i64, ppq: i32) -> i64 {
 
 pub fn to_snapshot(s: &FlpSnapshot) -> ProjectSnapshot {
     let mut snap = ProjectSnapshot { tempo: Some(s.tempo), files: s.files.iter().map(PathBuf::from).collect(), ..Default::default() };
-    // Notes live on channels: each channel-rack channel is a lane of its own
-    // (`fl-channel-<global index>`), the same lane the live bridge uses for
-    // the channel's generator and volume.
+    // Notes live on channels: each channel-rack channel is a track of its
+    // own (`fl-channel-<global index>`), the same track the live bridge uses
+    // for the channel's generator and volume.
     for p in &s.patterns {
-        let mut by_lane: std::collections::BTreeMap<i32, Vec<Note>> = Default::default();
+        let mut by_track: std::collections::BTreeMap<i32, Vec<Note>> = Default::default();
         for n in &p.notes {
-            by_lane.entry(n.channel).or_default().push(Note {
+            by_track.entry(n.channel).or_default().push(Note {
                 start: SongPos::from_ticks(ticks(n.position, s.ppq)),
                 length_ticks: ticks(n.length.max(1), s.ppq),
                 key: n.key.clamp(0, 127) as u8,
@@ -142,10 +142,10 @@ pub fn to_snapshot(s: &FlpSnapshot) -> ProjectSnapshot {
             });
         }
         let clip = p.name.clone().unwrap_or_else(|| format!("Pattern {}", p.iid));
-        for (chan, notes) in by_lane {
-            let lane = crate::FlBridge::lane_for_channel(chan);
-            snap.arrangement.push((lane.clone(), clip.clone(), SongPos::START));
-            snap.notes.push((lane, clip.clone(), notes));
+        for (chan, notes) in by_track {
+            let track = crate::FlBridge::track_for_channel(chan);
+            snap.arrangement.push((track.clone(), clip.clone(), SongPos::START));
+            snap.notes.push((track, clip.clone(), notes));
         }
     }
     snap
@@ -156,4 +156,4 @@ pub fn read_project(python: &Path, flp: &Path) -> std::io::Result<ProjectSnapsho
 }
 
 #[allow(dead_code)]
-fn _lane(_: LaneId) {}
+fn _track(_: TrackId) {}

@@ -20,6 +20,8 @@ class FakeMixer:
         self.pan = {0: 0.0, 1: 0.0, 2: -0.25}
         self.mute = {0: False, 1: False, 2: True}
         self.names = {0: "Master", 1: "Drums", 2: "Bass"}
+        self.colors = {}
+        self.selected = 0
     def trackCount(self): return 4  # master + 2 inserts + utility
     def getTrackName(self, i): return self.names.get(i, "")
     def getTrackVolume(self, i, mode=0): return self.vol.get(i, 0.8)
@@ -30,6 +32,10 @@ class FakeMixer:
     def muteTrack(self, i, value=-1): self.mute[i] = not self.mute.get(i, False)
     def getCurrentTempo(self, asInt=False): return 128000  # BPM*1000 as on FL 25
     def getTrackPluginId(self, i, slot): return ((i << 6) + slot) << 16
+    def getTrackColor(self, i): return self.colors.get(i, 0x445566)
+    def setTrackColor(self, i, c): self.colors[i] = c
+    def trackNumber(self): return self.selected
+    def setTrackNumber(self, i, flags=0): self.selected = i
     def getSongTickPos(self, mode=0): return 192
 
 
@@ -53,6 +59,8 @@ class FakeChannels:
         self.pan = {0: 0.0, 1: 0.25}
         self.mute = {0: False, 1: False}
         self.insert = {0: 1, 1: 2}
+        self.colors = {}
+        self.selected = 0
     def channelCount(self, g=False): return 2
     def getChannelName(self, i, g=False): return self.names[i]
     def getTargetFxTrack(self, i): return self.insert[i]
@@ -62,6 +70,10 @@ class FakeChannels:
     def setChannelVolume(self, i, v, pickup=0, g=False): self.vol[i] = v
     def setChannelPan(self, i, v, pickup=0, g=False): self.pan[i] = v
     def muteChannel(self, i, value=-1, g=False): self.mute[i] = not self.mute[i]
+    def getChannelColor(self, i, g=False): return self.colors.get(i, 0x778899)
+    def setChannelColor(self, i, c, g=False): self.colors[i] = c
+    def selectedChannel(self, canBeNone=0, offset=0, g=False): return self.selected
+    def selectOneChannel(self, i, g=False): self.selected = i
 
 
 class FakeTransport:
@@ -92,10 +104,12 @@ class FakeMidi:
 
 
 class FakeUi:
-    def getFocused(self, i): return i == FakeMidi.widMixer
+    def __init__(self): self.focused = FakeMidi.widMixer; self.shown = []
+    def getFocused(self, i): return i == self.focused
     def getFocusedFormID(self): return -1
     def getProgTitle(self): return "FL Studio 2025 - my song.flp"
     def getVersion(self, mode=0): return "Producer Edition v25.2.5 [build 5319]"
+    def showWindow(self, w): self.shown.append(w)
 
 
 class Ev:
@@ -233,11 +247,12 @@ class HandlerTests(unittest.TestCase):
         flit.SENT.clear()
         for _ in range(25):
             flit.OnIdle()
-        evs = [o for (d, i, o) in flit.SENT if d == flit.DIR_EVENT]
+        evs = [o for (d, i, o) in flit.SENT if d == flit.DIR_EVENT and o.get("ev") != "focus"]
         self.assertEqual(len(evs), 1); self.assertEqual(evs[0]["ev"], "heartbeat"); self.assertEqual(evs[0]["tempo"], 128.0)
         self.assertEqual(evs[0]["changed"], -1, "fake general has no getChangedFlag: reported as -1, never raises")
         self.assertIn("my song.flp", evs[0]["title"])
         self.assertEqual((evs[0]["undo_count"], evs[0]["undo_pos"]), (-1, -1), "fake general has no undo history: -1, never raises")
+        self.assertEqual(evs[0]["recording"], False, "fake transport has no isRecording: False, never raises")
         flit.SENT.clear()
         flit.OnRefresh(1); flit.OnUpdateBeatIndicator(1)
         self.assertEqual([o for (d, i, o) in flit.SENT if d == flit.DIR_EVENT], [], "fallback heartbeat only when OnIdle has been quiet for a second")
@@ -252,3 +267,42 @@ class HandlerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PresenceTests(unittest.TestCase):
+    def setUp(self):
+        install_fakes()
+
+    def test_focus_reports_only_changes_and_snapshot_has_colors(self):
+        flit._last_focus = None
+        flit.SENT.clear()
+        flit._report_focus()
+        flit._report_focus()
+        events = [o for (d, i, o) in flit.SENT if d == flit.DIR_EVENT and o.get("ev") == "focus"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["focus"], "mixer")
+        self.assertEqual(events[0]["track"], 0)
+        flit.ui.focused = FakeMidi.widPianoRoll
+        flit.channels.selected = 1
+        flit._report_focus()
+        events = [o for (d, i, o) in flit.SENT if d == flit.DIR_EVENT and o.get("ev") == "focus"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1]["focus"], "piano_roll")
+        self.assertEqual(events[1]["channel"], 1)
+        snap = request({"cmd": "snapshot"})[0]
+        self.assertEqual(snap["tracks"][0]["color"], 0x445566)
+        self.assertEqual(snap["channels"][0]["color"], 0x778899)
+
+    def test_colors_select_and_windows(self):
+        self.assertEqual(request({"cmd": "set_track_color", "track": 1, "color": 0xE07A5F})[0]["ok"], True)
+        self.assertEqual(flit.mixer.colors[1], 0xE07A5F)
+        self.assertEqual(request({"cmd": "set_channel_color", "chan": 1, "color": 0x4FB286})[0]["ok"], True)
+        self.assertEqual(flit.channels.colors[1], 0x4FB286)
+        self.assertEqual(request({"cmd": "select_track", "track": 2})[0]["ok"], True)
+        self.assertEqual(flit.mixer.selected, 2)
+        self.assertEqual(request({"cmd": "select_channel", "chan": 1})[0]["ok"], True)
+        self.assertEqual(flit.channels.selected, 1)
+        self.assertEqual(request({"cmd": "show_window", "window": "piano_roll"})[0]["ok"], True)
+        self.assertEqual(flit.ui.shown, [FakeMidi.widPianoRoll])
+        self.assertEqual(request({"cmd": "show_window", "window": "nope"})[0]["ok"], False)
+

@@ -2,7 +2,7 @@
 //! keep only the final value. 1000 twists = 1 event. A knob returned to
 //! where it started = 0 events.
 
-use flit_core::{DeviceSlot, LaneId, MixerChange, ParamId, PluginIdentity, SongPos, TransportChange};
+use flit_core::{DeviceSlot, TrackId, MixerChange, ParamId, PluginIdentity, SongPos, TransportChange};
 use std::collections::HashMap;
 
 pub const DEFAULT_SETTLE_MS: u64 = 150;
@@ -10,18 +10,18 @@ pub const DEFAULT_SETTLE_MS: u64 = 150;
 /// What is being turned.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ControlKey {
-    Param { lane: LaneId, slot: DeviceSlot, param: ParamId },
-    Volume(LaneId),
-    Pan(LaneId),
-    Mute(LaneId),
+    Param { track: TrackId, slot: DeviceSlot, param: ParamId },
+    Volume(TrackId),
+    Pan(TrackId),
+    Mute(TrackId),
     Tempo,
 }
 
 /// A settled change ready to become one event.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Settled {
-    Param { lane: LaneId, slot: DeviceSlot, plugin: PluginIdentity, param: ParamId, value: f32, pos: SongPos },
-    Mixer { lane: LaneId, change: MixerChange, pos: SongPos },
+    Param { track: TrackId, slot: DeviceSlot, plugin: PluginIdentity, param: ParamId, value: f32, pos: SongPos },
+    Mixer { track: TrackId, change: MixerChange, pos: SongPos },
     Tempo { bpm: f64, pos: SongPos },
 }
 
@@ -97,20 +97,20 @@ impl Settler {
                 continue;
             }
             let settled = match key {
-                ControlKey::Param { lane, slot, param } => {
+                ControlKey::Param { track, slot, param } => {
                     let Some(plugin) = g.plugin else { continue };
-                    Settled::Param { lane, slot, plugin, param, value: g.latest as f32, pos: g.pos }
+                    Settled::Param { track, slot, plugin, param, value: g.latest as f32, pos: g.pos }
                 }
-                ControlKey::Volume(lane) => Settled::Mixer { lane, change: MixerChange::Volume(g.latest as f32), pos: g.pos },
-                ControlKey::Pan(lane) => Settled::Mixer { lane, change: MixerChange::Pan(g.latest as f32), pos: g.pos },
-                ControlKey::Mute(lane) => Settled::Mixer { lane, change: MixerChange::Mute(g.latest >= 0.5), pos: g.pos },
+                ControlKey::Volume(track) => Settled::Mixer { track, change: MixerChange::Volume(g.latest as f32), pos: g.pos },
+                ControlKey::Pan(track) => Settled::Mixer { track, change: MixerChange::Pan(g.latest as f32), pos: g.pos },
+                ControlKey::Mute(track) => Settled::Mixer { track, change: MixerChange::Mute(g.latest >= 0.5), pos: g.pos },
                 ControlKey::Tempo => Settled::Tempo { bpm: g.latest, pos: g.pos },
             };
             out.push(settled);
         }
         out.sort_by_key(|s| match s {
-            Settled::Param { lane, param, .. } => format!("0{lane}{param}"),
-            Settled::Mixer { lane, .. } => format!("1{lane}"),
+            Settled::Param { track, param, .. } => format!("0{track}{param}"),
+            Settled::Mixer { track, .. } => format!("1{track}"),
             Settled::Tempo { .. } => "2".into(),
         });
         out
@@ -131,7 +131,7 @@ mod tests {
     use super::*;
 
     fn key() -> ControlKey {
-        ControlKey::Param { lane: LaneId::new("d"), slot: DeviceSlot(0), param: ParamId::new("x") }
+        ControlKey::Param { track: TrackId::new("d"), slot: DeviceSlot(0), param: ParamId::new("x") }
     }
     fn plug() -> Option<PluginIdentity> {
         Some(PluginIdentity::vst3("A", "B", "1"))
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn two_controls_settle_independently() {
         let mut s = Settler::new(150);
-        s.input(ControlKey::Volume(LaneId::new("a")), 0.8, None, SongPos::START, 0);
+        s.input(ControlKey::Volume(TrackId::new("a")), 0.8, None, SongPos::START, 0);
         s.input(ControlKey::Tempo, 130.0, None, SongPos::START, 100);
         let first = s.flush(200);
         assert_eq!(first.len(), 1);

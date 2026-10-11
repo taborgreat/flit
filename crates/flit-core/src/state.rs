@@ -204,11 +204,27 @@ pub struct SongSettings {
     pub required_version: Option<String>,
     /// Keeper Name + machine (None = the song owner's machine, unnamed).
     pub keeper: Option<(Id, String)>,
+    /// Song: the org it belongs to (PACK 2 §1).
+    #[serde(default)]
+    pub org: Option<Hash>,
+    #[serde(default)]
+    pub access: crate::org::Access,
+    #[serde(default)]
+    pub ai_policy: crate::org::AiPolicy,
+    /// Org: name and color.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub color: Option<u32>,
+    #[serde(default)]
+    pub defaults: crate::org::OrgDefaults,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl Default for SongSettings {
     fn default() -> Self {
-        Self { tempo: 120.0, time_sig: TimeSig::default(), reference_daw: None, required_version: None, keeper: None }
+        Self { tempo: 120.0, time_sig: TimeSig::default(), reference_daw: None, required_version: None, keeper: None, org: None, access: Default::default(), ai_policy: Default::default(), label: None, color: None, defaults: Default::default(), archived: false }
     }
 }
 
@@ -237,6 +253,9 @@ pub struct SongState {
     pub histories: Vec<ActId>,
     pub chat: Vec<ActId>,
     pub presence: BTreeMap<BeingRef, PresenceState>,
+    /// Albums (orgs and personal shelves), by their Create act.
+    #[serde(default)]
+    pub albums: crate::org::Albums,
     /// How many acts have been folded in (for incremental updates).
     pub applied: usize,
 }
@@ -283,6 +302,26 @@ impl SongState {
                 SettingsChange::ReferenceDaw(b) => self.settings.reference_daw = Some(b.clone()),
                 SettingsChange::RequiredVersion(v) => self.settings.required_version = Some(v.clone()),
                 SettingsChange::TimeSignature { beats, unit } => self.settings.time_sig = TimeSig { numerator: *beats, denominator: *unit },
+                SettingsChange::Org { org, access } => {
+                    self.settings.org = *org;
+                    self.settings.access = *access;
+                }
+                SettingsChange::AiPolicy(p) => self.settings.ai_policy = *p,
+                SettingsChange::Label(l) => self.settings.label = Some(l.clone()),
+                SettingsChange::Color(c) => self.settings.color = Some(*c),
+                SettingsChange::Defaults(d) => self.settings.defaults = d.clone(),
+                SettingsChange::Archived(a) => self.settings.archived = *a,
+            },
+            Payload::Album(a) => match (thing, a) {
+                (_, crate::org::AlbumAction::Create { .. }) => {
+                    self.albums.entry(act_id).or_default().apply(act_id, being, a);
+                }
+                (Thing::Album(id), _) => {
+                    if let Some(album) = self.albums.get_mut(id) {
+                        album.apply(act_id, being, a);
+                    }
+                }
+                _ => {}
             },
             Payload::Keeper(k) => self.settings.keeper = Some((k.name, k.machine.clone())),
             Payload::Version(v) => {

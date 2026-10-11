@@ -8,7 +8,9 @@ members = [
     "crates/flit-audio",
     "crates/flit-ipc",
     "crates/flit-agent",
+    "crates/flit-ui",
     "crates/flit-plugin",
+    "crates/flit-app",
     "bridges/fake",
     "bridges/fl",
     "tools/fake-session",
@@ -27,6 +29,8 @@ flit-host = { path = "crates/flit-host" }
 flit-net = { path = "crates/flit-net" }
 flit-audio = { path = "crates/flit-audio" }
 flit-ipc = { path = "crates/flit-ipc" }
+flit-ui = { path = "crates/flit-ui" }
+flit-agent = { path = "crates/flit-agent" }
 flit-bridge-fake = { path = "bridges/fake" }
 flit-bridge-fl = { path = "bridges/fl" }
 
@@ -68,6 +72,8 @@ nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "d
 # plugin window never takes keyboard focus (FL keeps the keys), so nothing
 # can be typed into the panel. The feature focuses the window whenever egui
 # wants keyboard input (BillyDM/egui-baseview#20).
+# The app window: glow (OpenGL) backend, no accesskit, no persistence.
+eframe = { version = "0.31.1", default-features = false, features = ["glow", "default_fonts"] }
 egui-baseview = { git = "https://github.com/BillyDM/egui-baseview.git", rev = "ec70c3fe6b2f070dcacbc22924431edbe24bd1c0", features = ["windows_keyboard_workaround"] }
 
 [profile.release]

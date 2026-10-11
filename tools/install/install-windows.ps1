@@ -1,14 +1,15 @@
 # FLit dev install for Windows (session 2). Run from the repo root in PowerShell:
 #   powershell -ExecutionPolicy Bypass -File tools\install\install-windows.ps1 [-NoBuild] [-SystemPlugins]
 # What it does (the real installer is M6; this is the developer path):
-#  1. builds flit-agent, fake-session and the plugin (VST3 + CLAP) in release (unless -NoBuild)
-#  2. copies flit-agent.exe, fake-session.exe and the PyFLP helper to %LOCALAPPDATA%\flit\bin
+#  1. builds flit-app (FLit), flit-agent (headless helper), fake-session and the plugin (VST3 + CLAP) in release (unless -NoBuild)
+#  2. copies flit-app.exe, flit-agent.exe, fake-session.exe and the PyFLP helper to %LOCALAPPDATA%\flit\bin
 #  3. makes a Python venv with pyflp at %LOCALAPPDATA%\flit\venv (level 2: reading .flp files)
 #  4. copies the plugin bundles to the per-user plugin folders
 #     (%LOCALAPPDATA%\Programs\Common\VST3 and \CLAP); with -SystemPlugins also to
 #     C:\Program Files\Common Files\VST3 and \CLAP (one UAC prompt), which is where FL looks by default
 #  5. copies the FL controller script into FL's hardware scripts folder
-#  6. creates the loopMIDI ports "FLit In" and "FLit Out" (loopMIDI must be installed:
+#  6. DEV ONLY, replaced at M6 by a port the app creates itself (FLIT_SPEC.md section 25):
+#     creates the loopMIDI ports "FLit In" and "FLit Out" (loopMIDI must be installed:
 #     winget install TobiasErichsen.loopMIDI) by writing its registry list and restarting it
 #  7. prints the one-time FL Studio steps (MIDI settings)
 param(
@@ -28,7 +29,7 @@ $venvCmake = Join-Path $root ".venv\Scripts"
 if (Test-Path $venvCmake) { $env:PATH = "$venvCmake;$env:PATH" }
 
 if (-not $NoBuild) {
-    cargo build --release -p flit-agent -p fake-session
+    cargo build --release -p flit-app -p flit-agent -p fake-session
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     cargo xtask bundle flit-plugin --release
     if ($LASTEXITCODE -ne 0) { throw "cargo xtask bundle failed" }
@@ -37,6 +38,7 @@ if (-not $NoBuild) {
 # 2. agent + CLI + helper
 $bin = Join-Path $env:LOCALAPPDATA "flit\bin"
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
+Copy-Item -Force "target\release\flit-app.exe" $bin
 Copy-Item -Force "target\release\flit-agent.exe" $bin
 Copy-Item -Force "target\release\fake-session.exe" $bin
 Copy-Item -Force "bridges\fl\flp\flit_flp.py" $bin
@@ -98,7 +100,8 @@ Write-Host ""
 Write-Host "Installed:"
 Write-Host "  $userVst3\FLit.vst3   (and $userClap\FLit.clap)"
 if ($SystemPlugins) { Write-Host "  C:\Program Files\Common Files\VST3\FLit.vst3   (FL's default search folder)" }
-Write-Host "  $bin\flit-agent.exe   (the plugin starts it on demand; it picks the FL bridge when the loopMIDI ports exist)"
+Write-Host "  $bin\flit-app.exe     (FLit. The plugin starts it in the background on demand; launch it yourself for the window. Picks the FL bridge when the loopMIDI ports exist)"
+Write-Host "  $bin\flit-agent.exe   (the same helper without a window, for always-on partners)"
 Write-Host "  $bin\fake-session.exe (command line for the agent)"
 Write-Host "  $scripts\device_FLit.py"
 if ($loopOk) { Write-Host "  loopMIDI ports 'FLit In' and 'FLit Out' (loopMIDI restarted)" }

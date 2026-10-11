@@ -1,12 +1,13 @@
-//! FLit plugin (VST3 + CLAP): a thin client of flit-agent.
+//! FLit plugin (VST3 + CLAP): a thin connector to the FLit app (PACK 2 §7).
 //!
-//! One plugin, several modes:
-//! - Master: the panel (home, Songs/Friends/History/Chat), transport info
-//!   for level 0, the reference mix (send when I own the mix lane, hear
-//!   when I choose to).
-//! - Lane: streams this lane out at the print point and feeds saves.
-//! - Receiver: plays a friend's lane in.
+//! One plugin, four modes:
+//! - Track: streams this track out at the print point and feeds saves.
+//!   Named "master" it is the session link: transport for level 0 and the
+//!   reference mix (sent when my being is the song's Reference DAW).
+//! - Receiver: plays a friend's track in. Named "master" it hears the
+//!   reference mix instead of the local one.
 //! - Talk send / Talk receive: a live track outside the song.
+//! The panel is compact (`flit_ui::compact`); the full UI is the app.
 //!
 //! Audio thread rule: `process()` only reads/writes lock-free rings and
 //! atomics. A worker thread moves audio between the rings and the agent.
@@ -38,12 +39,9 @@ pub struct FlitParams {
     pub editor_state: Arc<EguiState>,
     #[id = "mode"]
     pub mode: EnumParam<Mode>,
-    /// Which lane this instance is (Lane/Receiver modes) or Talk name.
-    #[persist = "lane"]
-    pub lane: Arc<RwLock<String>>,
-    /// Hear the reference mix instead of my local mix (Master mode).
-    #[id = "hearref"]
-    pub hear_reference: BoolParam,
+    /// Which track this instance is (Track/Receiver modes) or the Talk name.
+    #[persist = "track"]
+    pub track: Arc<RwLock<String>>,
     /// Monitor received audio (Receiver / Talk receive).
     #[id = "monitor"]
     pub monitor: BoolParam,
@@ -54,10 +52,9 @@ pub struct FlitParams {
 impl Default for FlitParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(1200, 760),
-            mode: EnumParam::new("Mode", Mode::Master).non_automatable(),
-            lane: Arc::new(RwLock::new(String::new())),
-            hear_reference: BoolParam::new("Hear reference mix", false).non_automatable(),
+            editor_state: EguiState::from_size(520, 230),
+            mode: EnumParam::new("Mode", Mode::Track).non_automatable(),
+            track: Arc::new(RwLock::new(String::new())),
             monitor: BoolParam::new("Monitor", true),
             receive_gain: FloatParam::new("Receive gain", 1.0, FloatRange::Linear { min: 0.0, max: 2.0 }).with_smoother(SmoothingStyle::Linear(20.0)),
         }
@@ -116,10 +113,11 @@ impl Plugin for FlitPlugin {
         let t = context.transport();
         self.shared.transport.store(t.playing, t.tempo.unwrap_or(120.0), t.pos_beats().unwrap_or(0.0));
         let mode = self.params.mode.value();
-        let hear_ref = self.params.hear_reference.value();
+        // a Receiver named "master" hears the reference mix in place of the local one
+        let replace = mode == Mode::Receiver && self.shared.master.load(Ordering::Relaxed);
         let monitor = self.params.monitor.value();
         let gain = self.params.receive_gain.smoothed.next();
-        engine.process(buffer, mode, hear_ref, monitor, gain, self.shared.connected.load(Ordering::Relaxed));
+        engine.process(buffer, mode, replace, monitor, gain, self.shared.connected.load(Ordering::Relaxed));
         ProcessStatus::Normal
     }
 }

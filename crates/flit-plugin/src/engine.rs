@@ -3,16 +3,16 @@
 use nih_plug::prelude::*;
 use rtrb::{Consumer, Producer, RingBuffer};
 
+/// The four things an instance can be (PACK 2 §8.5). A Track or Receiver
+/// instance named "master" is the session link: it sends (or hears) the
+/// reference mix. The panel itself is the FLit app now.
 #[derive(Enum, Debug, PartialEq, Clone, Copy)]
 pub enum Mode {
-    #[id = "master"]
-    #[name = "Master (panel)"]
-    Master,
-    #[id = "lane"]
-    #[name = "Lane (send)"]
-    Lane,
+    #[id = "track"]
+    #[name = "Track (send)"]
+    Track,
     #[id = "receiver"]
-    #[name = "Lane (receive)"]
+    #[name = "Track (receive)"]
     Receiver,
     #[id = "talksend"]
     #[name = "Talk (send)"]
@@ -49,11 +49,13 @@ impl Engine {
 
     /// One block. `connected` = the worker currently has an agent; when it
     /// does not, audio keeps flowing through untouched (addendum 2 §1).
-    pub fn process(&mut self, buffer: &mut Buffer, mode: Mode, hear_reference: bool, monitor: bool, gain: f32, connected: bool) {
+    /// `replace` = a Receiver on the master hearing the reference mix: the
+    /// local mix is replaced while connected, heard as is otherwise.
+    pub fn process(&mut self, buffer: &mut Buffer, mode: Mode, replace: bool, monitor: bool, gain: f32, connected: bool) {
         let channels = buffer.channels().min(self.channels);
-        let sends = matches!(mode, Mode::Lane | Mode::TalkSend | Mode::Master);
-        let receives = matches!(mode, Mode::Receiver | Mode::TalkReceive) || (mode == Mode::Master && hear_reference);
-        let replace_output = mode == Mode::Master && hear_reference && connected;
+        let sends = matches!(mode, Mode::Track | Mode::TalkSend);
+        let receives = matches!(mode, Mode::Receiver | Mode::TalkReceive);
+        let replace_output = mode == Mode::Receiver && replace && connected;
         for mut frame in buffer.iter_samples() {
             if sends {
                 // Captured at the print point: this plugin sits after the
@@ -88,7 +90,7 @@ mod tests {
     //! received audio only mixes in when it is there.
     use super::*;
 
-    fn run_block(engine: &mut Engine, input: &mut [Vec<f32>], mode: Mode, hear_ref: bool, monitor: bool, connected: bool) {
+    fn run_block(engine: &mut Engine, input: &mut [Vec<f32>], mode: Mode, replace: bool, monitor: bool, connected: bool) {
         let mut buffer = Buffer::default();
         let n = input[0].len();
         unsafe {
@@ -99,14 +101,14 @@ mod tests {
                 }
             });
         }
-        engine.process(&mut buffer, mode, hear_ref, monitor, 1.0, connected);
+        engine.process(&mut buffer, mode, replace, monitor, 1.0, connected);
     }
 
     #[test]
-    fn lane_mode_passes_audio_through_and_captures() {
+    fn track_mode_passes_audio_through_and_captures() {
         let (mut engine, mut rings) = Engine::new(48_000, 2, 512);
         let mut input = vec![vec![0.25f32; 64], vec![-0.5f32; 64]];
-        run_block(&mut engine, &mut input, Mode::Lane, false, true, true);
+        run_block(&mut engine, &mut input, Mode::Track, false, true, true);
         assert!(input[0].iter().all(|s| *s == 0.25), "output untouched");
         assert!(input[1].iter().all(|s| *s == -0.5));
         let mut captured = Vec::new();
@@ -123,7 +125,7 @@ mod tests {
         let (mut engine, _rings) = Engine::new(1_000, 2, 64);
         let mut input = vec![vec![0.1f32; 64], vec![0.1f32; 64]];
         for _ in 0..200 {
-            run_block(&mut engine, &mut input, Mode::Lane, false, true, false);
+            run_block(&mut engine, &mut input, Mode::Track, false, true, false);
         }
         assert!(engine.dropped > 0, "ring overflow is counted, not blocking");
         assert!(input[0].iter().all(|s| *s == 0.1), "audio still passes");
@@ -151,19 +153,19 @@ mod tests {
     }
 
     #[test]
-    fn master_hear_reference_replaces_output_only_when_connected() {
+    fn master_receiver_replaces_output_only_when_connected() {
         let (mut engine, mut rings) = Engine::new(48_000, 2, 64);
         for _ in 0..8 {
             rings.play.push(0.3).unwrap();
         }
         let mut input = vec![vec![1.0f32; 4], vec![1.0f32; 4]];
-        run_block(&mut engine, &mut input, Mode::Master, true, true, false);
+        run_block(&mut engine, &mut input, Mode::Receiver, true, true, false);
         assert!(input[0].iter().all(|s| (*s - 1.3).abs() < 1e-6), "disconnected: local mix (plus whatever was left) is heard");
         let mut input = vec![vec![1.0f32; 4], vec![1.0f32; 4]];
         for _ in 0..8 {
             rings.play.push(0.3).unwrap();
         }
-        run_block(&mut engine, &mut input, Mode::Master, true, true, true);
+        run_block(&mut engine, &mut input, Mode::Receiver, true, true, true);
         assert!(input[0].iter().all(|s| (*s - 0.3).abs() < 1e-6), "connected: the reference mix replaces the local one");
     }
 }

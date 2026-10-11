@@ -1,7 +1,9 @@
 //! flit-agent as a library (so tests and tools can run agents in-process).
 pub mod agent;
 pub mod bridge;
+pub mod cli;
 pub mod store;
+pub mod updates;
 
 pub use agent::{Agent, AgentConfig};
 pub use bridge::{AnyBridge, NoBridge};

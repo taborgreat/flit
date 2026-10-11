@@ -23,7 +23,7 @@ impl ProtocolHandler for BlobHandler {
     async fn accept(&self, conn: Connection) -> std::result::Result<(), AcceptError> {
         let inner = self.0.clone();
         let peer = crate::id_of(&conn.remote_id());
-        let member = inner.song.lock().unwrap().as_ref().map(|s| s.crew().is_member(&peer)).unwrap_or(false);
+        let member = inner.container_ids().iter().any(|id| inner.member_of(id, &peer));
         if inner.is_blocked(&peer) || !member {
             conn.close(1u32.into(), b"not in crew");
             return Ok(());
@@ -33,10 +33,7 @@ impl ProtocolHandler for BlobHandler {
             tokio::spawn(async move {
                 let Ok(Some(BlobMsg::Get(hashes))) = read_msg::<BlobMsg>(&mut recv).await else { return };
                 for h in hashes.iter().take(10_000) {
-                    let data = {
-                        let g = inner.song.lock().unwrap();
-                        g.as_ref().and_then(|s| s.blobs().get(h).ok())
-                    };
+                    let data = inner.container_ids().iter().find_map(|id| inner.with_container(id, |s| s.blobs().get(h).ok()).flatten());
                     match data {
                         Some(bytes) => {
                             if write_msg(&mut send, &BlobMsg::Found { hash: *h, len: bytes.len() as u64 }).await.is_err() {
@@ -60,14 +57,17 @@ impl ProtocolHandler for BlobHandler {
     }
 }
 
-/// Fetch `hashes` from `from`. Already-present ones are skipped. Each blob
-/// is verified against its hash and counted against the peer's quota.
+/// Fetch `hashes` from `from` into the open song's store. Already-present
+/// ones are skipped. Each blob is verified against its hash and counted
+/// against the peer's quota.
 pub(crate) async fn fetch(inner: Arc<Inner>, from: Id, hashes: Vec<Hash>) -> Result<Vec<Hash>> {
-    let wanted: Vec<Hash> = {
-        let g = inner.song.lock().unwrap();
-        let s = g.as_ref().ok_or(Error::NoSong)?;
-        s.blobs().missing(hashes.iter())
-    };
+    let song = inner.song.lock().unwrap().as_ref().map(|s| s.id()).ok_or(Error::NoSong)?;
+    fetch_into(inner, from, song, hashes).await
+}
+
+/// The same into any container's store (an org's album covers).
+pub(crate) async fn fetch_into(inner: Arc<Inner>, from: Id, container: flit_core::SongId, hashes: Vec<Hash>) -> Result<Vec<Hash>> {
+    let wanted: Vec<Hash> = inner.with_container(&container, |s| s.blobs().missing(hashes.iter())).ok_or(Error::NoSong)?;
     if wanted.is_empty() {
         return Ok(vec![]);
     }
@@ -87,10 +87,7 @@ pub(crate) async fn fetch(inner: Arc<Inner>, from: Id, hashes: Vec<Hash>) -> Res
                     break;
                 }
                 let bytes = read_exact_bytes(&mut recv, len as usize).await?;
-                let ok = {
-                    let g = inner.song.lock().unwrap();
-                    g.as_ref().map(|s| s.blobs().put_verified(&hash, &bytes).is_ok()).unwrap_or(false)
-                };
+                let ok = inner.with_container(&container, |s| s.blobs().put_verified(&hash, &bytes).is_ok()).unwrap_or(false);
                 if ok {
                     got.push(hash);
                     inner.emit(NetEvent::BlobFetched { hash, from });

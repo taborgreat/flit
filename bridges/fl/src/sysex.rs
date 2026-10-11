@@ -11,7 +11,7 @@ pub const SYSEX_END: u8 = 0xF7;
 pub const HEADER: [u8; 5] = [0x7D, b'F', b'L', b'i', b't'];
 /// Bytes of base64 payload per SysEx message. Windows MIDI buffers are
 /// typically 1024 bytes; flstudio-mcp saw 1000 OK / 2000 dropped.
-pub const CHUNK_PAYLOAD: usize = 600; // VERIFY ON WINDOWS: raise if 900 survives loopMIDI -> FL -> loopMIDI
+pub const CHUNK_PAYLOAD: usize = 600; // VERIFY ON WINDOWS: raise if 900 survives the virtual MIDI port -> FL -> port (per port kind, FLIT_SPEC.md 25)
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +74,14 @@ pub enum FlRequest {
     Focus,
     /// Window title (closest thing to the project file name).
     Title,
+    /// Presence tints (0xRRGGBB): restored by the bridge, never saved.
+    SetTrackColor { track: i32, color: u32 },
+    SetChannelColor { chan: i32, color: u32 },
+    /// Follow: select a mixer track / a channel, open a window
+    /// ("mixer" | "piano_roll" | "playlist" | "channel_rack").
+    SelectTrack { track: i32 },
+    SelectChannel { chan: i32 },
+    ShowWindow { window: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -85,6 +93,9 @@ pub struct FlTrack {
     pub mute: bool,
     /// (slot, plugin name) for slots that hold a plugin.
     pub slots: Vec<(i32, String)>,
+    /// Track color 0xRRGGBB (FL's own, before any presence tint).
+    #[serde(default)]
+    pub color: u32,
 }
 
 /// A channel-rack channel. `plugin` is the generator's name (None for a
@@ -99,6 +110,8 @@ pub struct FlChannel {
     pub volume: f32,
     pub pan: f32,
     pub mute: bool,
+    #[serde(default)]
+    pub color: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -127,7 +140,14 @@ pub enum FlReply {
         channels: Vec<FlChannel>,
     },
     Params { ok: bool, track: i32, slot: i32, total: u32, next: u32, params: Vec<FlParam> },
-    Focus { ok: bool, focus: String, track: i32, slot: i32 },
+    Focus {
+        ok: bool,
+        focus: String,
+        track: i32,
+        slot: i32,
+        #[serde(default)]
+        channel: Option<i32>,
+    },
     Title { ok: bool, title: String },
     Ok { ok: bool },
 }
@@ -155,6 +175,9 @@ pub enum FlEvent {
         undo_count: Option<i32>,
         #[serde(default)]
         undo_pos: Option<i32>,
+        /// FL's record button. Stop while it is on = a take ended.
+        #[serde(default)]
+        recording: Option<bool>,
     },
     /// Something changed: FL dirty flags plus which mixer tracks / channels.
     Dirty {
@@ -165,7 +188,15 @@ pub enum FlEvent {
     },
     /// OnProjectLoad finished.
     ProjectLoaded { title: String },
-    Focus { focus: String, track: i32, slot: i32 },
+    /// Where the user is: the focused window, the selected mixer track
+    /// (-1 = none), the plugin slot (-1), the selected channel.
+    Focus {
+        focus: String,
+        track: i32,
+        slot: i32,
+        #[serde(default)]
+        channel: Option<i32>,
+    },
     Log { text: String },
 }
 

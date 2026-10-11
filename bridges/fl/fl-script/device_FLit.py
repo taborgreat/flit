@@ -5,8 +5,9 @@
 
 Copy this folder to
   Documents\\Image-Line\\FL Studio\\Settings\\Hardware\\FLit\\device_FLit.py
-and in Options > MIDI Settings enable the loopMIDI ports "FLit In" (input,
+and in Options > MIDI Settings enable the virtual MIDI ports "FLit In" (input,
 Controller type: FLit (user), Port 42) and "FLit Out" (output, Port 42).
+How those ports exist is the app's business (bridges/fl/src/port.rs).
 
 It speaks SysEx to the flit-agent (see ../src/sysex.rs for the protocol).
 Everything FL-specific lives here or in the Rust bridge; the FLit core
@@ -153,6 +154,10 @@ def _track(i):
                 slots.append([s, plugins.getPluginName(i, s)])
         except Exception:
             pass
+    try:
+        color = int(mixer.getTrackColor(i)) & 0xFFFFFF
+    except Exception:
+        color = 0
     return {
         "index": i,
         "name": mixer.getTrackName(i),
@@ -160,6 +165,7 @@ def _track(i):
         "pan": float(mixer.getTrackPan(i)),
         "mute": bool(mixer.isTrackMuted(i)),
         "slots": slots,
+        "color": color,
     }
 
 
@@ -185,6 +191,7 @@ def _channel(i):
         "volume": g(lambda: float(channels.getChannelVolume(i, False, True)), 0.78125),  # 0.78125 = default/unity
         "pan": g(lambda: float(channels.getChannelPan(i, True)), 0.0),
         "mute": g(lambda: bool(channels.isChannelMuted(i, True)), False),
+        "color": g(lambda: int(channels.getChannelColor(i, True)) & 0xFFFFFF, 0),
     }
 
 
@@ -220,24 +227,65 @@ def _params(track, slot, start, count):
     return {"ok": True, "track": track, "slot": slot, "total": int(total), "next": int(end), "params": out}
 
 
+def _selected_track():
+    try:
+        return int(mixer.trackNumber())
+    except Exception:
+        return -1
+
+
+def _selected_channel():
+    try:
+        return int(channels.selectedChannel(0, 0, True))
+    except Exception:
+        try:
+            return int(channels.selectedChannel())
+        except Exception:
+            return -1
+
+
 def _focus():
+    # Where the user is: the focused window plus the selected mixer track
+    # and channel. This is presence (FLIT_SPEC section 9); the bridge
+    # settles it, so a burst of clicks is one moment.
+    track = _selected_track()
+    chan = _selected_channel()
     try:
         if ui.getFocused(midi.widPluginEffect) or ui.getFocused(midi.widPluginGenerator) or ui.getFocused(midi.widPlugin):
             fid = ui.getFocusedFormID()
             if fid >= 0:
-                track, slot = fid >> 22, (fid >> 16) & 0x3F  # track*4194304 + slot*65536. VERIFY ON WINDOWS
-                return {"focus": "plugin", "track": track, "slot": slot}
+                t, slot = fid >> 22, (fid >> 16) & 0x3F  # track*4194304 + slot*65536. VERIFY ON WINDOWS
+                return {"focus": "plugin", "track": t, "slot": slot, "channel": chan}
         if ui.getFocused(midi.widMixer):
-            return {"focus": "mixer", "track": -1, "slot": -1}
+            return {"focus": "mixer", "track": track, "slot": -1, "channel": chan}
         if ui.getFocused(midi.widPianoRoll):
-            return {"focus": "piano_roll", "track": -1, "slot": -1}
+            return {"focus": "piano_roll", "track": -1, "slot": -1, "channel": chan}
         if ui.getFocused(midi.widPlaylist):
-            return {"focus": "playlist", "track": -1, "slot": -1}
+            return {"focus": "playlist", "track": -1, "slot": -1, "channel": chan}
         if ui.getFocused(midi.widChannelRack):
-            return {"focus": "channel_rack", "track": -1, "slot": -1}
+            return {"focus": "channel_rack", "track": -1, "slot": -1, "channel": chan}
+        if ui.getFocused(midi.widBrowser):
+            return {"focus": "browser", "track": -1, "slot": -1, "channel": chan}
     except Exception:
         pass
-    return {"focus": "other", "track": -1, "slot": -1}
+    return {"focus": "other", "track": track, "slot": -1, "channel": chan}
+
+
+_last_focus = None
+
+
+def _report_focus():
+    # Only changes travel; the bridge settles them (~500 ms) into one act.
+    global _last_focus
+    f = _focus()
+    if f != _last_focus:
+        _last_focus = f
+        ev = dict(f)
+        ev["ev"] = "focus"
+        _event(ev)
+
+
+_WINDOWS = {"mixer": "widMixer", "piano_roll": "widPianoRoll", "playlist": "widPlaylist", "channel_rack": "widChannelRack", "browser": "widBrowser"}
 
 
 def _changed_flag():
@@ -270,7 +318,11 @@ def _heartbeat():
     _last_heartbeat = time.monotonic()
     try:
         undo_count, undo_pos = _undo_history()
-        _event({"ev": "heartbeat", "playing": bool(transport.isPlaying()), "tempo": _tempo(), "pos_ticks": _pos_ticks(), "changed": _changed_flag(), "title": _title(), "undo_count": undo_count, "undo_pos": undo_pos})
+        try:
+            recording = bool(transport.isRecording())
+        except Exception:
+            recording = False
+        _event({"ev": "heartbeat", "playing": bool(transport.isPlaying()), "tempo": _tempo(), "pos_ticks": _pos_ticks(), "changed": _changed_flag(), "title": _title(), "undo_count": undo_count, "undo_pos": undo_pos, "recording": recording})
     except Exception:
         pass
 
@@ -361,6 +413,28 @@ def handle(req_id, req):
             f = _focus()
             f["ok"] = True
             _reply(req_id, f)
+        elif cmd == "set_track_color":
+            # Presence tint: the bridge restores the original and strips it
+            # before any save. VERIFY ON WINDOWS: setTrackColor arg format
+            # (0xRRGGBB assumed) and that it does not mark the project changed.
+            mixer.setTrackColor(int(req["track"]), int(req["color"]) & 0xFFFFFF)
+            _reply(req_id, {"ok": True})
+        elif cmd == "set_channel_color":
+            channels.setChannelColor(int(req["chan"]), int(req["color"]) & 0xFFFFFF, True)
+            _reply(req_id, {"ok": True})
+        elif cmd == "select_track":
+            mixer.setTrackNumber(int(req["track"]))
+            _reply(req_id, {"ok": True})
+        elif cmd == "select_channel":
+            channels.selectOneChannel(int(req["chan"]), True)
+            _reply(req_id, {"ok": True})
+        elif cmd == "show_window":
+            w = _WINDOWS.get(str(req.get("window", "")))
+            if w is None:
+                _err(req_id, "unknown window %r" % (req.get("window"),))
+            else:
+                ui.showWindow(getattr(midi, w))
+                _reply(req_id, {"ok": True})
         elif cmd == "title":
             _reply(req_id, {"ok": True, "title": ui.getProgTitle()})  # VERIFY ON WINDOWS: contains "name.flp"?
         else:
@@ -421,6 +495,8 @@ def OnIdle():
     global _idle_count
     _idle_count += 1
     _flush_dirty()
+    if _idle_count % 10 == 0:  # ~every 200 ms: presence (only changes travel)
+        _report_focus()
     if _idle_count % 25 == 0:  # ~every 500 ms
         _heartbeat()
 

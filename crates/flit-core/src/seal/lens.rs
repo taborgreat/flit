@@ -12,9 +12,10 @@ use crate::position::SongPos;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Lens {
     /// All facts in the history, keeper seal order.
+    #[default]
     Song,
     SongSettings,
     /// That track and all its devices, fact order.
@@ -30,6 +31,8 @@ pub enum Lens {
     Team,
     /// Both filters, e.g. Me x Track Drums.
     Combine(Box<Lens>, Box<Lens>),
+    /// One album's facts (its Create and everything on its thing).
+    Album(crate::blob::Hash),
 }
 
 impl Lens {
@@ -43,7 +46,7 @@ impl Lens {
 
     pub fn is_thing_lens(&self) -> bool {
         match self {
-            Lens::SongSettings | Lens::Track(_) | Lens::Device { .. } => true,
+            Lens::SongSettings | Lens::Track(_) | Lens::Device { .. } | Lens::Album(_) => true,
             Lens::Combine(a, b) => a.is_thing_lens() || b.is_thing_lens(),
             _ => false,
         }
@@ -58,6 +61,7 @@ impl Lens {
             Lens::Me(b) | Lens::Being(b) => row.being == *b,
             Lens::Name(n) => row.being.name == *n,
             Lens::Combine(a, b) => a.keeps(row) && b.keeps(row),
+            Lens::Album(id) => row.thing == Thing::Album(*id) || row.act == *id,
         }
     }
 }
@@ -247,6 +251,21 @@ pub fn summarize(act: &Act, chains: &Chains) -> String {
             CrewAction::BlockBeing { being } => format!("blocked {}", being_label(being)),
             CrewAction::UnblockBeing { being } => format!("unblocked {}", being_label(being)),
             CrewAction::Pardon { being } => format!("accepted {}'s moments again", being_label(being)),
+            CrewAction::Invite { id } => format!("invited {}", who(id)),
+            CrewAction::Accept => format!("{} joined", who(&act.name())),
+            CrewAction::Decline => format!("{} declined", who(&act.name())),
+            CrewAction::Leave => format!("{} left", who(&act.name())),
+            CrewAction::Demote { id } => format!("{} is no longer an owner", who(id)),
+        },
+        Payload::Album(a) => match a {
+            crate::org::AlbumAction::Create { name } => format!("album \"{name}\""),
+            crate::org::AlbumAction::Rename(n) => format!("album renamed \"{n}\""),
+            crate::org::AlbumAction::SetDescription(_) => "album description".into(),
+            crate::org::AlbumAction::SetCover(c) => if c.is_some() { "album cover".into() } else { "album cover removed".into() },
+            crate::org::AlbumAction::AddSong { song, .. } => format!("song {} added", song.short()),
+            crate::org::AlbumAction::RemoveSong { song } => format!("song {} removed", song.short()),
+            crate::org::AlbumAction::Reorder(_) => "album order".into(),
+            crate::org::AlbumAction::Archive(on) => if *on { "album archived".into() } else { "album unarchived".into() },
         },
         Payload::Being(b) => match &b.action {
             BeingAction::Create { kind, display_name, .. } => format!("being \"{display_name}\" ({kind})"),
@@ -278,6 +297,18 @@ pub fn summarize(act: &Act, chains: &Chains) -> String {
             SettingsChange::ReferenceDaw(b) => format!("reference DAW: {}", being_label(b)),
             SettingsChange::RequiredVersion(v) => format!("requires FLit {v}"),
             SettingsChange::TimeSignature { beats, unit } => format!("time signature {beats}/{unit}"),
+            SettingsChange::Org { org, access } => match org {
+                Some(o) => format!("org {}, access {}", o.short(), access.word()),
+                None => "no org".into(),
+            },
+            SettingsChange::AiPolicy(p) => format!("ai policy: {}", match p {
+                crate::org::AiPolicy::Grants => "grants",
+                crate::org::AiPolicy::OwnHistoryOnly => "own history only",
+            }),
+            SettingsChange::Label(l) => format!("named \"{l}\""),
+            SettingsChange::Color(c) => format!("color #{c:06X}"),
+            SettingsChange::Defaults(_) => "defaults for new songs".into(),
+            SettingsChange::Archived(a) => if *a { "archived".into() } else { "unarchived".into() },
         },
     }
 }

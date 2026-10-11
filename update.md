@@ -24,12 +24,34 @@ Code names:
 - Track a mixer/instrument/bus/master track. No owner.
 - Thing anything with a fact chain (song, song settings, track,
   device). Fact chains are written only by the keeper.
-  User-facing words: Moment, History, Track, Being, Merge, Timeline,
-  Go back, New history from here, Save version, Crew, Song code.
-  NEVER show users: line, idea, branch, lane, stamp, commit, key,
-  Merge.
-  Retired concepts: lanes, lane owners, ownership handoff, "offer to
-  owner", mix lane, lines, ideas, Assist/Partner as special types.
+  USER-FACING WORDS (Tabor, 2026-10-11). The panel, the app, the tutorial,
+  Help, notices and docs written for users say ONLY these. Code keeps the
+  code names above; never rename a type to match.
+
+    code name          users see
+    Name               Studio          (your account; "your Studio")
+    Being              member          ("Studio member"; a human, AI or
+                                        scripted member)
+    Act, Fact          moment          (one word for both; filters may
+                                        still group by who did it and by
+                                        what it happened to, but the rows
+                                        are moments)
+    Organization       org             (a group of Studios)
+    Song               song
+    Album              album           (a group of songs)
+    History            history         ("main" is the main history)
+    Track              track
+    Keeper             keeper
+    Crew               crew            (the Studios in a song)
+    Merge              Merge           (the button; "merge" as the verb)
+    Timeline bar       Timeline
+    Save version, Go back, New history from here, Song code: unchanged.
+
+  DEAD WORDS (never in UI, docs or new code; delete when found): ID (say
+  "public key" or "Studio code"), line, idea, branch, lane, lane owner,
+  mix lane, Bring in, Try an idea, offer to owner, Assist, Partner,
+  stamp (in UI), commit, repo, account, server, "Being" and "Name" in
+  anything a user reads.
 
 =====================================================================
 
@@ -750,6 +772,10 @@ timeline identical; kill mid-append -> reopen -> torn line skipped,
 fold clean; a copied spine from another peer verifies frame by frame
 (signature, height, spine_prev) before use.
 
+=============================
+
+START HERE NOW
+
 4.5 = xoming soon check again
 alright here it is only worry once u are done withe verything else
 
@@ -811,8 +837,8 @@ MAY check (extends FLIT_UPDATE_PACK section 5):
   (unless the Name is also in that song's own crew). Everything already
   done stays.
 
-===================================================================== 2. ALBUMS: tag songs into ordered collections
-=====================================================================
+# ===================================================================== 2. ALBUMS: tag songs into ordered collections
+
 An album is an ordered list of songs with a name. A song can be in any
 number of albums. Albums never change songs; they only group them.
 
@@ -836,8 +862,8 @@ Who may act:
   placeholder ("1 private song") or not at all (org setting).
   Albums are just facts: rewind, history and lenses work on them too.
 
-===================================================================== 3. FRONTEND CHANGES
-=====================================================================
+# ===================================================================== 3. FRONTEND CHANGES
+
 Follow FLIT_UPDATE_PACK section 12 (theme.rs tokens, Plex fonts, no
 pills, 4px grid). New and changed screens:
 
@@ -863,40 +889,40 @@ Tabs (segmented): Songs | Albums | Members | Settings
 - Settings: name, color/icon, keeper machine, defaults (access,
   required version, ai policy), [Leave org], [Archive org] (owner).
 
-3.4 New song dialog
-Under: [Me] or [<org>] dropdown.
-Access (if under an org): [Org] [Private] segmented, default from
-org settings.
-Then the existing flow (New song / Share this project).
+  3.4 New song dialog
+  Under: [Me] or [<org>] dropdown.
+  Access (if under an org): [Org] [Private] segmented, default from
+  org settings.
+  Then the existing flow (New song / Share this project).
 
-3.5 Song settings
-New block "Org & access": org (none / pick), access toggle,
-"Who can act here" summary (song crew + org members).
-Album membership: chips for each album this song is in, [+ Add to
-album] (personal or org albums you can edit).
+  3.5 Song settings
+  New block "Org & access": org (none / pick), access toggle,
+  "Who can act here" summary (song crew + org members).
+  Album membership: chips for each album this song is in, [+ Add to
+  album] (personal or org albums you can edit).
 
-3.6 Album page
-Header: name, cover, description, owner (you or the org).
-Ordered song list: drag to reorder, [Add song], remove per row.
-Each row: song name, org badge, access badge, last activity (Time
-axis display only), avatars of beings live in it now.
-Locked rows for songs you can't access (if the org shows them).
+  3.6 Album page
+  Header: name, cover, description, owner (you or the org).
+  Ordered song list: drag to reorder, [Add song], remove per row.
+  Each row: song name, org badge, access badge, last activity (Time
+  axis display only), avatars of beings live in it now.
+  Locked rows for songs you can't access (if the org shows them).
 
-3.7 Invites inbox
-Each invite: from (Name + being), to (org or song), [Accept]
-[Decline]. Accept/decline are acts.
+  3.7 Invites inbox
+  Each invite: from (Name + being), to (org or song), [Accept]
+  [Decline]. Accept/decline are acts.
 
-3.8 Hover cards and badges
-Song and being hover cards show org badge when relevant.
-Timeline (FLIT_UPDATE_PACK section 8): unchanged; a song's org is
-shown in the History switcher header as a small badge.
+  3.8 Hover cards and badges
+  Song and being hover cards show org badge when relevant.
+  Timeline (FLIT_UPDATE_PACK section 8): unchanged; a song's org is
+  shown in the History switcher header as a small badge.
 
-3.9 Empty states
-No orgs: one line + [New org]. No albums: one line + [New album].
-Keep them quiet; no illustrations.
+  3.9 Empty states
+  No orgs: one line + [New org]. No albums: one line + [New album].
+  Keep them quiet; no illustrations.
 
-===================================================================== 4. STORAGE (extends FLIT_UPDATE_PACK section 24)
-=====================================================================
+# ===================================================================== 4. STORAGE (extends FLIT_UPDATE_PACK section 24)
+
 Per org (every member holds a copy):
 orgs/<org>/spines/<name>.tree acts by member Names in this org
 orgs/<org>/spines/keeper.tree org keeper's sealed facts
@@ -905,8 +931,7 @@ Personal albums: on the Name's own personal spine under the Name's
 profile (synced only to that Name's own machines/beings).
 Songs keep their own folders; the org link is a fact in the song.
 
-===================================================================== 5. TESTS
-=====================================================================
+# ===================================================================== 5. TESTS
 
 - Invite without accept: not a member; with accept: member on every
   member peer.
@@ -921,8 +946,8 @@ Songs keep their own folders; the org link is a fact in the song.
   the album thing; rewind shows earlier album order.
 - Song access change appears in the song's History with who changed it.
 
-===================================================================== 6. THE SHELF: SELF-HOSTED SHARING AND FINDING PEOPLE (later)
-=====================================================================
+# ===================================================================== 6. THE SHELF: SELF-HOSTED SHARING AND FINDING PEOPLE (later)
+
 Not for the first build. Start simple; it reuses everything above.
 Borrows TreeOS ideas: the Library / shelf, listings, covers.
 
@@ -982,8 +1007,8 @@ Borrows TreeOS ideas: the Library / shelf, listings, covers.
   land in main; only crew can merge guest histories; following pulls
   listing facts only.
 
-===================================================================== 7. STANDALONE APP + THIN PLUGIN (replaces "plugin is the panel")
-=====================================================================
+# ===================================================================== 7. STANDALONE APP + THIN PLUGIN (replaces "plugin is the panel")
+
 FLit is a standalone desktop app. The plugin is a thin connector.
 (Extends FLIT_UPDATE_PACK section 10 process model: flit-agent becomes
 the FLit app, with its own window.)
@@ -1029,8 +1054,8 @@ Tests: kill the DAW mid-session -> app keeps state, timeline intact;
 kill the plugin -> app unaffected; two DAWs open -> both linked to one
 app and one identity; app closed -> plugin starts it.
 
-===================================================================== 8. MOVING FROM "PLUGIN IS THE APP" TO APP + PLUGIN (step by step)
-=====================================================================
+# ===================================================================== 8. MOVING FROM "PLUGIN IS THE APP" TO APP + PLUGIN (step by step)
+
 Goal: get from the current build (UI and logic inside the plugin) to
 section 7 without ever breaking what works. Each step ends with the
 whole thing still usable and all tests passing. Commit per step.
@@ -1044,7 +1069,7 @@ whole thing still usable and all tests passing. Commit per step.
   - control messages: hello, link song, open window, status).
     Done when: plugin still works exactly as before, now built on flit-ui.
 
-  8.2 App process, headless
+    8.2 App process, headless
 
 - New binary: flit-app. Move everything that is not audio-thread or
   DAW-session work out of the plugin into flit-app: spines, keeper,

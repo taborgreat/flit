@@ -118,6 +118,11 @@ pub struct Chains {
     pub(crate) fact_chains: HashMap<(Thing, HistoryId), Vec<FactId>>,
     pub(crate) histories: HashMap<HistoryId, HistoryChains>,
     pub(crate) genesis: Option<ActId>,
+    /// Song, org or personal shelf: read from the genesis act.
+    pub(crate) kind: crate::org::ContainerKind,
+    /// Songs with access = org: the org's current members (the agent sets
+    /// this from the org container; None = unknown, so crew only).
+    pub(crate) org_members: Option<BTreeSet<Id>>,
     pub(crate) crew: CrewState,
     pub(crate) beings: Beings,
     pub(crate) keeper: KeeperState,
@@ -125,6 +130,13 @@ pub struct Chains {
     pub(crate) pending_acts: HashMap<ActId, Vec<Act>>,
     /// Facts waiting for their act.
     pub(crate) pending_facts: HashMap<ActId, Vec<Fact>>,
+    /// Moments (fact, maybe with its act) that arrived ahead of earlier
+    /// facts of their history: applied in seal order once those land.
+    pub(crate) early_facts: HashMap<HistoryId, Vec<(Option<Act>, Fact)>>,
+    /// Acts from Names (or beings) the crew does not know yet: the
+    /// approval or declaration may still be on its way.
+    pub(crate) waiting_crew: Vec<Act>,
+    in_retry: bool,
     pub(crate) evidence: Vec<Equivocation>,
     pub(crate) evidence_acts: HashMap<ActId, Act>,
     /// Beings whose new acts the keeper holds until an owner decides.
@@ -147,11 +159,16 @@ impl Chains {
             fact_chains: HashMap::new(),
             histories,
             genesis: None,
+            kind: crate::org::ContainerKind::Song,
+            org_members: None,
             crew: CrewState::default(),
             beings: Beings::default(),
             keeper: KeeperState::default(),
             pending_acts: HashMap::new(),
             pending_facts: HashMap::new(),
+            early_facts: HashMap::new(),
+            waiting_crew: Vec::new(),
+            in_retry: false,
             evidence: Vec::new(),
             evidence_acts: HashMap::new(),
             held: BTreeSet::new(),
@@ -172,7 +189,7 @@ impl Chains {
         // sealed moments first, in the keeper's order
         for fact in loaded.facts {
             if let Some(act) = acts.remove(&fact.body.act_id) {
-                chains.append_act_inner(act, false, None)?;
+                chains.append_act_inner(act, false, None, false)?;
             }
             match chains.append_fact_inner(fact, false)? {
                 AppendOutcome::Pending => return Err(crate::Error::Invalid("a stored fact seals an act that is not stored".into())),
@@ -186,7 +203,7 @@ impl Chains {
             let before = rest.len();
             let mut again = Vec::new();
             for act in rest {
-                match chains.append_act_inner(act.clone(), false, None) {
+                match chains.append_act_inner(act.clone(), false, None, false) {
                     Ok(AppendOutcome::Pending) => {}
                     Ok(_) => {}
                     Err(_) => again.push(act),
@@ -224,6 +241,35 @@ impl Chains {
     /// The song's id: its genesis act.
     pub fn song_id(&self) -> Option<Hash> {
         self.genesis
+    }
+
+    pub fn kind(&self) -> crate::org::ContainerKind {
+        self.kind
+    }
+
+    /// Who may act here besides the crew (songs only).
+    pub fn access(&self) -> crate::org::Access {
+        self.state(&main_history()).map(|s| s.settings.access).unwrap_or_default()
+    }
+
+    pub fn org_members(&self) -> Option<&BTreeSet<Id>> {
+        self.org_members.as_ref()
+    }
+
+    /// Tell a song who its org's members are; acts that waited for a crew
+    /// decision are tried again.
+    pub fn set_org_members(&mut self, members: Option<BTreeSet<Id>>) {
+        if self.org_members == members {
+            return;
+        }
+        self.org_members = members;
+        if !self.waiting_crew.is_empty() {
+            let persist = self.store.is_some();
+            let waiting = std::mem::take(&mut self.waiting_crew);
+            for w in waiting {
+                let _ = self.append_act_inner(w, persist, None, true);
+            }
+        }
     }
 
     pub fn crew(&self) -> &CrewState {
@@ -461,7 +507,7 @@ impl Chains {
     }
 
     pub fn pending_count(&self) -> usize {
-        self.pending_acts.values().map(|v| v.len()).sum::<usize>() + self.pending_facts.values().map(|v| v.len()).sum::<usize>()
+        self.pending_acts.values().map(|v| v.len()).sum::<usize>() + self.pending_facts.values().map(|v| v.len()).sum::<usize>() + self.early_facts.values().map(|v| v.len()).sum::<usize>() + self.waiting_crew.len()
     }
 
     /// Acts we are waiting for (ask peers for these).
@@ -474,10 +520,18 @@ impl Chains {
 
     // ----- writing -----
 
-    /// Verify and add an act (ours or a peer's). Applied optimistically to
-    /// its history's view; written to the Name's spine when there is a store.
+    /// Verify and add our own act. Applied optimistically to its history's
+    /// view; written to the Name's spine when there is a store. A MAY
+    /// failure is an error.
     pub fn append_act(&mut self, act: Act, received_at: Option<u64>) -> crate::Result<AppendOutcome> {
-        self.append_act_inner(act, true, received_at)
+        self.append_act_inner(act, true, received_at, false)
+    }
+
+    /// Verify and add a peer's act (ACT). Like `append_act`, but an act
+    /// from a Name or being this copy does not know yet waits for the
+    /// approval or declaration instead of failing.
+    pub fn import_act(&mut self, act: Act, received_at: Option<u64>) -> crate::Result<AppendOutcome> {
+        self.append_act_inner(act, true, received_at, true)
     }
 
     /// Verify and add a keeper's fact. Needs its act (else Pending).
@@ -485,20 +539,55 @@ impl Chains {
         self.append_fact_inner(fact, true)
     }
 
-    /// A MOMENT: the fact with its act.
+    /// A MOMENT: the fact with its act. Moments apply in the keeper's
+    /// order: one that arrives ahead of earlier moments of its history
+    /// waits, act and all. If the act has to wait for its prev, the fact
+    /// waits with it.
     pub fn append_moment(&mut self, act: Act, fact: Fact, received_at: Option<u64>) -> crate::Result<AppendOutcome> {
-        let a = self.append_act_inner(act, true, received_at)?;
-        if a == AppendOutcome::Pending || a == AppendOutcome::Equivocation {
+        if self.facts.contains_key(&fact.id) {
+            return Ok(AppendOutcome::Duplicate);
+        }
+        if !self.acts.contains_key(&act.id) && self.fact_is_early(&fact) {
+            // The fact must wait for earlier seals, but the act itself can
+            // land now (optimistically) so acts that hang off it are not
+            // stuck behind it. If it cannot land yet, it waits with the fact.
+            let landed = matches!(self.append_act_inner(act.clone(), true, received_at, true), Ok(AppendOutcome::Appended) | Ok(AppendOutcome::Duplicate));
+            let history = fact.history();
+            self.early_facts.entry(history).or_default().push((if landed { None } else { Some(act) }, fact));
+            if !self.in_retry {
+                self.in_retry = true;
+                self.retry_all_early(true);
+                self.in_retry = false;
+            }
+            return Ok(AppendOutcome::Pending);
+        }
+        let a = self.append_act_inner(act, true, received_at, true)?;
+        if a == AppendOutcome::Equivocation {
             return Ok(a);
         }
-        self.append_fact_inner(fact, true)
+        let f = self.append_fact_inner(fact, true)?;
+        Ok(if a == AppendOutcome::Pending { AppendOutcome::Pending } else { f })
     }
 
-    fn append_act_inner(&mut self, act: Act, persist: bool, received_at: Option<u64>) -> crate::Result<AppendOutcome> {
+    fn fact_is_early(&self, fact: &Fact) -> bool {
+        match self.histories.get(&fact.history()) {
+            None => true,
+            Some(h) => fact.body.seal_seq > h.sealed.len() as u64 + 1,
+        }
+    }
+
+    fn append_act_inner(&mut self, act: Act, persist: bool, received_at: Option<u64>, park: bool) -> crate::Result<AppendOutcome> {
         if self.acts.contains_key(&act.id) {
             return Ok(AppendOutcome::Duplicate);
         }
-        match verify::act(self, &act)? {
+        let checked = match verify::act(self, &act) {
+            Err(crate::Error::NotInCrew(_)) | Err(crate::Error::UnknownBeing(_)) if park => {
+                self.waiting_crew.push(act);
+                return Ok(AppendOutcome::Pending);
+            }
+            other => other?,
+        };
+        match checked {
             verify::ActCheck::Ok => {}
             verify::ActCheck::Duplicate => return Ok(AppendOutcome::Duplicate),
             verify::ActCheck::Pending(prev) => {
@@ -518,6 +607,7 @@ impl Chains {
                 return Ok(AppendOutcome::Equivocation);
             }
         }
+        let opens_crew = matches!(act.payload(), Payload::Crew(_) | Payload::Being(_));
         self.insert_act(act.clone(), received_at);
         if persist {
             if let Some(store) = &self.store {
@@ -530,7 +620,7 @@ impl Chains {
         // acts and facts that were waiting for this one
         if let Some(children) = self.pending_acts.remove(&act.id) {
             for child in children {
-                let _ = self.append_act_inner(child, persist, None);
+                let _ = self.append_act_inner(child, persist, None, true);
             }
         }
         if let Some(facts) = self.pending_facts.remove(&act.id) {
@@ -538,7 +628,76 @@ impl Chains {
                 let _ = self.append_fact_inner(f, persist);
             }
         }
+        // a History act opens a history that early moments may be waiting for
+        if self.histories.contains_key(&act.id) {
+            self.retry_early(&act.id, persist);
+        }
+        if !self.early_facts.is_empty() && !self.in_retry {
+            self.in_retry = true;
+            self.retry_all_early(persist);
+            self.in_retry = false;
+        }
+        if opens_crew && !self.waiting_crew.is_empty() {
+            let waiting = std::mem::take(&mut self.waiting_crew);
+            for w in waiting {
+                let _ = self.append_act_inner(w, persist, None, true);
+            }
+        }
         Ok(AppendOutcome::Appended)
+    }
+
+    fn retry_all_early(&mut self, persist: bool) {
+        let hs: Vec<HistoryId> = self.early_facts.keys().copied().collect();
+        for h in hs {
+            self.retry_early(&h, persist);
+        }
+    }
+
+    /// Land early moments of a history now that earlier ones are here.
+    fn retry_early(&mut self, history: &HistoryId, persist: bool) {
+        loop {
+            let Some(mut list) = self.early_facts.remove(history) else { return };
+            list.sort_by_key(|(_, f)| f.body.seal_seq);
+            let before = list.len();
+            let mut keep = Vec::new();
+            for (act, f) in list {
+                if self.fact_is_early(&f) {
+                    keep.push((act, f));
+                    continue;
+                }
+                if let Some(a) = act {
+                    if !self.acts.contains_key(&a.id) {
+                        match self.append_act_inner(a.clone(), persist, None, true) {
+                            Ok(AppendOutcome::Pending) => {
+                                keep.push((Some(a), f));
+                                continue;
+                            }
+                            Ok(AppendOutcome::Equivocation) | Err(_) => continue,
+                            Ok(_) => {}
+                        }
+                    }
+                }
+                match verify::fact(self, &f) {
+                    Ok(verify::FactCheck::Early) | Ok(verify::FactCheck::Pending(_)) => keep.push((None, f)),
+                    Ok(verify::FactCheck::Ok) => {
+                        self.insert_fact(f.clone());
+                        if persist {
+                            if let Some(store) = &self.store {
+                                let _ = store.append_fact(&f);
+                            }
+                        }
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            let progressed = keep.len() < before;
+            if !keep.is_empty() {
+                self.early_facts.insert(*history, keep);
+            }
+            if !progressed {
+                return;
+            }
+        }
     }
 
     fn append_fact_inner(&mut self, fact: Fact, persist: bool) -> crate::Result<AppendOutcome> {
@@ -552,13 +711,19 @@ impl Chains {
                 self.pending_facts.entry(act).or_default().push(fact);
                 return Ok(AppendOutcome::Pending);
             }
+            verify::FactCheck::Early => {
+                self.early_facts.entry(fact.history()).or_default().push((None, fact));
+                return Ok(AppendOutcome::Pending);
+            }
         }
+        let history = fact.history();
         self.insert_fact(fact.clone());
         if persist {
             if let Some(store) = &self.store {
                 store.append_fact(&fact)?;
             }
         }
+        self.retry_early(&history, persist);
         Ok(AppendOutcome::Appended)
     }
 
@@ -569,12 +734,13 @@ impl Chains {
         let history = act.history();
         if self.genesis.is_none() {
             self.genesis = Some(id);
+            self.kind = crate::org::ContainerKind::from_genesis_property(act.body.property.as_deref()).unwrap_or_default();
         }
         // whole-song effects apply as soon as the act is here (they are
         // signed by the Name or an owner; the seal only records order)
         match act.payload() {
             Payload::Crew(a) => {
-                self.crew.apply(a);
+                self.crew.apply_by(&act.name(), a);
                 if let CrewAction::Pardon { being } = a {
                     self.held.remove(being);
                 }

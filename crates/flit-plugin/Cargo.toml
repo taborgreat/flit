@@ -11,6 +11,7 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 flit-core.workspace = true
 flit-ipc.workspace = true
+flit-ui.workspace = true
 nih_plug_egui.workspace = true
 # only here to turn on its windows_keyboard_workaround feature (see the workspace Cargo.toml)
 egui-baseview.workspace = true
@@ -19,9 +20,6 @@ parking_lot.workspace = true
 atomic_float.workspace = true
 dirs.workspace = true
 serde.workspace = true
-qrcode.workspace = true
-arboard.workspace = true
-image.workspace = true
 
 # assert_process_allocs (allocation checks in the audio thread) does not work
 # with the mingw target (rust-assert-no-alloc#7), so it is on everywhere else.

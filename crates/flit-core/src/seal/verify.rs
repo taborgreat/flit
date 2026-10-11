@@ -38,6 +38,9 @@ pub enum FactCheck {
     Duplicate,
     /// Waiting for the act it seals.
     Pending(ActId),
+    /// Arrived ahead of earlier facts of its history (or of the act that
+    /// starts the history); kept until they land.
+    Early,
 }
 
 /// Does `signer` speak for the act's being in this song?
@@ -123,8 +126,14 @@ pub fn act(chains: &Chains, act: &Act) -> crate::Result<ActCheck> {
     check_ranges(act)?;
 
     // --- crew and being ---
+    // In the crew; or an invited Name answering an org's invite; or, in a
+    // song whose access is "org", a current member of that org.
     if !chains.crew.is_member(&name) {
-        return Err(crate::Error::NotInCrew(name));
+        let invited_reply = matches!(act.payload(), Payload::Crew(CrewAction::Accept | CrewAction::Decline)) && chains.crew.is_invited(&name);
+        let via_org = chains.kind.is_song() && chains.access() == crate::org::Access::Org && chains.org_members.as_ref().map(|m| m.contains(&name)).unwrap_or(false);
+        if !invited_reply && !via_org {
+            return Err(crate::Error::NotInCrew(name));
+        }
     }
     if chains.beings.is_revoked(&being) {
         return Err(crate::Error::RevokedBeing(being));
@@ -136,6 +145,18 @@ pub fn act(chains: &Chains, act: &Act) -> crate::Result<ActCheck> {
     let by_name_key = act.signed_by(&name);
     let is_ai = chains.beings.is_ai(&being);
 
+    // --- container kind: songs hold sound; orgs and shelves hold albums ---
+    let kind = chains.kind;
+    match act.payload() {
+        p if !kind.is_song() && (p.is_track_edit() || matches!(p, Payload::Transport(_) | Payload::Version(_) | Payload::Merge(_) | Payload::GoBack { .. } | Payload::Undo { .. })) => {
+            return Err(bad("that is a song moment; this is not a song"));
+        }
+        Payload::Album(_) if kind.is_song() => return Err(bad("albums live in orgs and personal shelves")),
+        Payload::Settings(SettingsChange::Org { .. } | SettingsChange::AiPolicy(_)) if !kind.is_song() => return Err(bad("org and ai policy are song settings")),
+        Payload::Settings(SettingsChange::Label(_) | SettingsChange::Color(_) | SettingsChange::Defaults(_) | SettingsChange::Archived(_)) if kind.is_song() => return Err(bad("label, color, defaults and archive are org settings")),
+        _ => {}
+    }
+
     // --- MAY ---
     match act.payload() {
         Payload::Crew(action) => {
@@ -143,7 +164,19 @@ pub fn act(chains: &Chains, act: &Act) -> crate::Result<ActCheck> {
             if history != main_history() {
                 return Err(bad("crew changes live on main"));
             }
-            chains.crew.check(&name, action)?;
+            chains.crew.check(&name, action, kind)?;
+        }
+        Payload::Album(a) => {
+            if history != main_history() {
+                return Err(bad("albums live on main"));
+            }
+            if let Thing::Album(id) = act.thing() {
+                let album = chains.state(&main_history()).and_then(|s| s.albums.get(id).cloned()).ok_or_else(|| bad("unknown album"))?;
+                let creator = album.created_by.as_ref().map(|b| b.name == name).unwrap_or(false);
+                if a.is_curation() && !is_owner && !creator {
+                    return Err(crate::Error::NotAllowed { being, what: "rename, describe, cover or archive an album it did not create (owners may)".into() });
+                }
+            }
         }
         Payload::Being(b) => {
             only_name_key(act, by_name_key, "being")?;
@@ -251,7 +284,8 @@ pub fn act(chains: &Chains, act: &Act) -> crate::Result<ActCheck> {
         p if p.is_track_edit() => {
             if is_ai {
                 let track = act.track().ok_or_else(|| bad("track edit without a track"))?;
-                if !ai_owns_history(chains, &being, &history) && !chains.beings.granted(&being, track) {
+                let policy = chains.state(&main_history()).map(|s| s.settings.ai_policy).unwrap_or_default();
+                if !ai_owns_history(chains, &being, &history) && (policy == crate::org::AiPolicy::OwnHistoryOnly || !chains.beings.granted(&being, track)) {
                     return Err(crate::Error::NotAllowed { being, what: format!("edit {track} in this history without a grant") });
                 }
             }
@@ -299,6 +333,9 @@ fn verify_genesis(act: &Act) -> crate::Result<()> {
     if act.gate() {
         return Err(crate::Error::BadGenesis("genesis is not a gate".into()));
     }
+    if crate::org::ContainerKind::from_genesis_property(act.body.property.as_deref()).is_none() {
+        return Err(crate::Error::BadGenesis("genesis names an unknown container kind".into()));
+    }
     match act.payload() {
         Payload::Crew(CrewAction::Approve { id, owner: true }) if *id == act.name() => Ok(()),
         _ => Err(crate::Error::BadGenesis("genesis must approve its Name as owner".into())),
@@ -315,6 +352,7 @@ pub fn check_shape(act: &Act) -> crate::Result<()> {
         ThingLevel::Presence => matches!(act.thing(), Thing::Presence(_)),
         ThingLevel::Song => *act.thing() == Thing::Song,
         ThingLevel::TrackOrSong => matches!(act.thing(), Thing::Song | Thing::Track(_)),
+        ThingLevel::Album => matches!(act.thing(), Thing::Album(_)),
     };
     if !level_ok {
         return Err(bad(format!("{:?} does not belong on {}", act.kind(), act.thing())));
@@ -348,7 +386,7 @@ pub fn fact(chains: &Chains, fact: &Fact) -> crate::Result<FactCheck> {
     keeper_ok(chains, fact)?;
     let history = fact.history();
     if !chains.histories.contains_key(&history) {
-        return Err(crate::Error::UnknownHistory(history));
+        return Ok(FactCheck::Early);
     }
     if *fact.thing() != *act.thing() {
         return Err(bad("fact thing does not match its act"));
@@ -359,16 +397,19 @@ pub fn fact(chains: &Chains, fact: &Fact) -> crate::Result<FactCheck> {
     if fact.body.gate && history == act.history() {
         return Err(bad("a gate fact lands in another history"));
     }
+    // seal order
+    let sealed = chains.histories.get(&history).map(|h| h.sealed.len() as u64).unwrap_or(0);
+    if fact.body.seal_seq > sealed + 1 {
+        return Ok(FactCheck::Early);
+    }
+    if fact.body.seal_seq != sealed + 1 {
+        return Err(crate::Error::BadSealChain(fact.id));
+    }
     // thing chain
     let chain = chains.fact_chains.get(&(fact.thing().clone(), history));
     let (prev, len) = chain.map(|v| (v.last().copied(), v.len() as u64)).unwrap_or((None, 0));
     if fact.body.fact_prev != prev || fact.body.fact_seq != len + 1 {
         return Err(crate::Error::BadFactChain(fact.id));
-    }
-    // seal order
-    let sealed = chains.histories.get(&history).map(|h| h.sealed.len() as u64).unwrap_or(0);
-    if fact.body.seal_seq != sealed + 1 {
-        return Err(crate::Error::BadSealChain(fact.id));
     }
     Ok(FactCheck::Ok)
 }
@@ -558,6 +599,35 @@ pub fn check_ranges(act: &Act) -> crate::Result<()> {
                 }
             }
             SettingsChange::ReferenceDaw(_) => {}
+            SettingsChange::Label(l) => {
+                if l.len() > 128 || l.chars().any(|c| c.is_control()) {
+                    return Err(bad("label out of bounds"));
+                }
+            }
+            SettingsChange::Defaults(d) => {
+                if d.required_version.as_ref().map(|v| v.is_empty() || v.len() > 32).unwrap_or(false) || d.keeper.as_ref().map(|(_, m)| m.len() > 128).unwrap_or(false) {
+                    return Err(bad("org defaults out of bounds"));
+                }
+            }
+            SettingsChange::Org { .. } | SettingsChange::AiPolicy(_) | SettingsChange::Color(_) | SettingsChange::Archived(_) => {}
+        },
+        Payload::Album(a) => match a {
+            crate::org::AlbumAction::Create { name } | crate::org::AlbumAction::Rename(name) => {
+                if name.is_empty() || name.len() > 128 || name.chars().any(|c| c.is_control()) {
+                    return Err(bad("album name must be 1..128 chars"));
+                }
+            }
+            crate::org::AlbumAction::SetDescription(d) => {
+                if d.len() > MAX_TEXT {
+                    return Err(bad("album description too long"));
+                }
+            }
+            crate::org::AlbumAction::Reorder(order) => {
+                if order.len() > 10_000 {
+                    return Err(bad("album order too long"));
+                }
+            }
+            crate::org::AlbumAction::SetCover(_) | crate::org::AlbumAction::AddSong { .. } | crate::org::AlbumAction::RemoveSong { .. } | crate::org::AlbumAction::Archive(_) => {}
         },
         Payload::Crew(_) | Payload::GoBack { .. } | Payload::Undo { .. } => {}
     }

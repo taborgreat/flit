@@ -52,9 +52,13 @@ impl Client {
         let rs = stream.try_clone()?;
         let p2 = pending.clone();
         let a2 = alive.clone();
+        let stop = alive.clone();
         let reader = std::thread::Builder::new().name("flit-ipc-reader".into()).spawn(move || {
             let mut rs = rs;
             loop {
+                if !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 let frame: io::Result<Frame> = read_sync(&mut rs);
                 match frame {
                     Ok(Frame { id, body: Body::Response(r) }) => {
@@ -163,9 +167,48 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.stream.flush();
-        // Closing the stream makes the reader thread exit.
+        // The reader blocks in a read on its own handle of the pipe, so
+        // closing ours does not wake it. It must be gone before we return:
+        // a DAW unloads the plugin DLL right after dropping the plugin, and
+        // a thread that wakes up afterwards runs unloaded code (FL Studio:
+        // "FLit.clap_unloaded", c0000005). Cancel the read, then join.
         if let Some(r) = self.reader.take() {
-            let _ = r;
+            self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                cancel_blocking_io(&r, &self.stream);
+                if r.is_finished() {
+                    let _ = r.join();
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// Make the reader thread's blocking read return an error. Windows: cancel
+/// the pending I/O on the pipe (every handle of the pipe shares the file
+/// object, so our handle reaches the reader's read) and the reader thread's
+/// synchronous I/O. Elsewhere nothing is done: the bounded wait in `Drop`
+/// still applies.
+#[allow(unused_variables)]
+fn cancel_blocking_io(reader: &std::thread::JoinHandle<()>, pipe: &Stream) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        use windows_sys::Win32::Foundation::HANDLE;
+        // SAFETY: valid handles owned by `pipe` and the JoinHandle; a null
+        // OVERLAPPED cancels every request on the file object.
+        unsafe {
+            #[allow(irrefutable_let_patterns)]
+            if let Stream::NamedPipe(np) = pipe {
+                windows_sys::Win32::System::IO::CancelIoEx(np.as_handle().as_raw_handle() as HANDLE, std::ptr::null());
+            }
+            windows_sys::Win32::System::IO::CancelSynchronousIo(reader.as_raw_handle() as HANDLE);
         }
     }
 }

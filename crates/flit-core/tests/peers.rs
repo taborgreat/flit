@@ -68,12 +68,12 @@ fn a_clock_years_off_changes_nothing_but_the_time_axis() {
     }
     assert_same_song(&net, &main());
     let rows = net.songs[0].history(&main());
-    let bob_rows: Vec<&Row> = rows.iter().filter(|r| r.being == bob.being_ref()).collect();
-    let carol_rows: Vec<&Row> = rows.iter().filter(|r| r.being == carol.being_ref()).collect();
+    let bob_rows: Vec<&Row> = rows.iter().filter(|r| r.being == bob.being_ref() && r.kind == Kind::Mixer).collect();
+    let carol_rows: Vec<&Row> = rows.iter().filter(|r| r.being == carol.being_ref() && r.kind == Kind::Mixer).collect();
     assert!(bob_rows.iter().all(|r| r.stamped_at >= far_future));
     assert!(carol_rows.iter().all(|r| r.stamped_at < 100));
     // seal order interleaves them as they arrived at the keeper, not by clock
-    let seal: Vec<u64> = rows.iter().filter(|r| r.being != alice.being_ref()).map(|r| r.seal_seq.unwrap()).collect();
+    let seal: Vec<u64> = rows.iter().filter(|r| r.being != alice.being_ref() && r.kind == Kind::Mixer).map(|r| r.seal_seq.unwrap()).collect();
     assert!(seal.windows(2).all(|w| w[0] < w[1]));
     assert_eq!(bob_rows[0].seal_seq.unwrap() + 1, carol_rows[0].seal_seq.unwrap(), "round by round, whatever the clocks said");
 }
@@ -506,7 +506,13 @@ fn validation_rejects_bad_acts() {
     let mut body = good.body.clone();
     body.name = eve.name;
     body.being = BeingId::new("eve");
-    assert!(matches!(net.song(0).import_act(Act::sign(body, &eve.key), 1), Err(Error::NotInCrew(_))));
+    body.act_prev = None;
+    body.act_seq = 1;
+    let eve_act = Act::sign(body, &eve.key);
+    assert_eq!(net.song(0).import_act(eve_act.clone(), 1).unwrap(), AppendOutcome::Pending, "a stranger's act waits for an approval that may be on its way");
+    assert_eq!(net.songs[0].chains().pending_count(), 1);
+    net.deliver_all();
+    assert!(!net.songs[0].chains().contains(&eve_act.id), "never applied");
     // out of range
     assert!(net.song(1).mixer(&bob, main(), &drums(), MixerChange::Volume(99.0), now).is_err());
     // unknown history
@@ -515,12 +521,22 @@ fn validation_rejects_bad_acts() {
     body.act_prev = None;
     body.act_seq = 1;
     assert!(matches!(net.song(0).import_act(Act::sign(body, &bob.key), 1), Err(Error::UnknownHistory(_))));
+    net.deliver_all();
+    assert!(net.songs.iter().all(|s| s.chains().is_sealed(&good.id)));
     // wrong thing for the payload
     let mut body = good.body.clone();
     body.thing = Thing::Song;
     body.act_prev = Some(good.id);
     body.act_seq += 1;
     assert!(matches!(net.song(0).import_act(Act::sign(body, &bob.key), 1), Err(Error::Invalid(_))));
-    net.deliver_all();
-    assert!(net.songs.iter().all(|s| s.chains().is_sealed(&good.id)));
+    // an act that arrives before its prev waits, then lands
+    let now = net.tick();
+    net.offline = vec![true, true, true];
+    let first = net.song(1).tempo(&bob, main(), 120.0, now).unwrap();
+    let second = net.song(1).tempo(&bob, main(), 121.0, now + 1).unwrap();
+    assert_eq!(net.song(0).import_act(second.clone(), 1).unwrap(), AppendOutcome::Pending);
+    assert_eq!(net.songs[0].chains().wanted(), vec![first.id]);
+    assert_eq!(net.song(0).import_act(first.clone(), 1).unwrap(), AppendOutcome::Appended);
+    assert!(net.songs[0].chains().is_sealed(&second.id));
+    assert_eq!(net.songs[0].main().settings.tempo, 121.0);
 }

@@ -119,6 +119,9 @@ pub enum Thing {
     Device { track: TrackId, slot: DeviceSlot },
     /// A being's own presence thing: written only by that being.
     Presence(BeingRef),
+    /// An album of an org or a personal shelf (PACK 2 §2); the id is its
+    /// Create act.
+    Album(Hash),
 }
 
 impl Thing {
@@ -142,6 +145,7 @@ impl Thing {
             Thing::Track(t) => format!("track/{t}"),
             Thing::Device { track, slot } => format!("track/{track}/device/{}", slot.0),
             Thing::Presence(b) => format!("presence/{}/{}", b.name.short_code(), b.being),
+            Thing::Album(a) => format!("album/{}", a.short()),
         }
     }
 }
@@ -174,6 +178,7 @@ pub enum Kind {
     GoBack,
     Undo,
     Settings,
+    Album,
 }
 
 // ----- payloads -----
@@ -319,6 +324,17 @@ pub enum CrewAction {
     /// An owner accepts a being's equivocation evidence as settled: the
     /// keeper seals its acts again.
     Pardon { being: BeingRef },
+    /// Org (PACK 2 §1): an owner invites a Name; membership needs the
+    /// Name's `Accept` too (countersigned).
+    Invite { id: Id },
+    /// The invited Name joins.
+    Accept,
+    /// A gate: the invited Name says no.
+    Decline,
+    /// A gate: a member leaves (the last owner cannot).
+    Leave,
+    /// An owner takes another owner's ownership (never the last one's).
+    Demote { id: Id },
 }
 
 /// Beings are created, updated and revoked by their Name (signed by the
@@ -447,6 +463,18 @@ pub enum SettingsChange {
     /// Exact app version the keeper seals; others are held.
     RequiredVersion(String),
     TimeSignature { beats: u8, unit: u8 },
+    /// Song: which org it belongs to (None = none) and who may act in it.
+    Org { org: Option<Hash>, access: crate::org::Access },
+    /// Song: what ai beings may do here (overrides the org default).
+    AiPolicy(crate::org::AiPolicy),
+    /// Org: its name.
+    Label(String),
+    /// Org: 0xRRGGBB.
+    Color(u32),
+    /// Org: defaults for its new songs.
+    Defaults(crate::org::OrgDefaults),
+    /// Org: archived (read-only for people; the chain stays).
+    Archived(bool),
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -471,6 +499,8 @@ pub enum Payload {
     GoBack { to: ActId },
     Undo { target: ActId },
     Settings(SettingsChange),
+    /// Album facts (orgs and personal shelves only).
+    Album(crate::org::AlbumAction),
 }
 
 impl Payload {
@@ -496,6 +526,7 @@ impl Payload {
             Payload::GoBack { .. } => Kind::GoBack,
             Payload::Undo { .. } => Kind::Undo,
             Payload::Settings(_) => Kind::Settings,
+            Payload::Album(_) => Kind::Album,
         }
     }
 
@@ -508,7 +539,7 @@ impl Payload {
     pub fn is_gate(&self) -> bool {
         matches!(
             self,
-            Payload::Crew(CrewAction::Remove { .. }) | Payload::Crew(CrewAction::BlockBeing { .. }) | Payload::Being(BeingPayload { action: BeingAction::Revoke, .. }) | Payload::Grant(GrantPayload { grant: false, .. })
+            Payload::Crew(CrewAction::Remove { .. }) | Payload::Crew(CrewAction::BlockBeing { .. }) | Payload::Crew(CrewAction::Decline) | Payload::Crew(CrewAction::Leave) | Payload::Being(BeingPayload { action: BeingAction::Revoke, .. }) | Payload::Grant(GrantPayload { grant: false, .. })
         )
     }
 
@@ -525,7 +556,14 @@ impl Payload {
             Payload::Settings(SettingsChange::ReferenceDaw(_)) => Some("reference_daw".into()),
             Payload::Settings(SettingsChange::RequiredVersion(_)) => Some("required_version".into()),
             Payload::Settings(SettingsChange::TimeSignature { .. }) => Some("time_signature".into()),
+            Payload::Settings(SettingsChange::Org { .. }) => Some("org".into()),
+            Payload::Settings(SettingsChange::AiPolicy(_)) => Some("ai_policy".into()),
+            Payload::Settings(SettingsChange::Label(_)) => Some("label".into()),
+            Payload::Settings(SettingsChange::Color(_)) => Some("color".into()),
+            Payload::Settings(SettingsChange::Defaults(_)) => Some("defaults".into()),
+            Payload::Settings(SettingsChange::Archived(_)) => Some("archived".into()),
             Payload::Keeper(_) => Some("keeper".into()),
+            Payload::Album(a) => Some(a.property()),
             _ => None,
         }
     }
@@ -540,6 +578,8 @@ impl Payload {
             Payload::Transport(_) | Payload::Settings(_) | Payload::Keeper(_) => ThingLevel::Settings,
             Payload::Presence(_) => ThingLevel::Presence,
             Payload::Merge(_) => ThingLevel::TrackOrSong,
+            Payload::Album(crate::org::AlbumAction::Create { .. }) => ThingLevel::Song,
+            Payload::Album(_) => ThingLevel::Album,
             _ => ThingLevel::Song,
         }
     }
@@ -553,6 +593,7 @@ pub enum ThingLevel {
     Device,
     Presence,
     TrackOrSong,
+    Album,
 }
 
 // ----- act -----

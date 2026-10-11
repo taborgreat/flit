@@ -1,13 +1,12 @@
 //! FakeHost: a simulated DAW that every test runs against. It has tracks
 //! with plugins and parameters, a mixer, a transport, a project file it can
-//! write, and lanes it can render (test tones). It can run at any level:
-//! at level 0 it is silent (the plugin alone does the work).
+//! write and load, tracks it can render (test tones), a focus it reports as
+//! presence, and it counts what the core asks of it (so tests can prove
+//! that applies are diffs). It can run at any level: at level 0 it is
+//! silent (the plugin alone does the work).
 
-use flit_core::{
-    DeviceSlot, HostTag, LaneId, LaneKind, MixerChange, Note, ParamId, PluginIdentity, PrintPoint, SongPos,
-    TransportChange,
-};
-use flit_host::{ApplyOutcome, Capabilities, Focus, HostBridge, HostEvent, Level, ProjectSnapshot, RenderedAudio};
+use flit_core::{DeviceSlot, HostTag, MixerChange, Note, ParamId, PluginIdentity, PresencePayload, PrintPoint, SongPos, TrackId, TransportChange, View};
+use flit_host::{ApplyOutcome, Capabilities, HostBridge, HostDevice, HostEvent, HostModel, HostTrack, Level, ProjectSnapshot, RenderedAudio, Shown, TrackKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,7 +22,7 @@ pub struct FakeDevice {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FakeTrack {
     pub name: String,
-    pub kind: LaneKind,
+    pub kind: TrackKind,
     /// Device slots in use (slot -> plugin + params).
     pub devices: BTreeMap<u32, FakeDevice>,
     pub volume: f32,
@@ -35,11 +34,14 @@ pub struct FakeTrack {
     pub tone_hz: f32,
     /// Host-only state (routing etc.) as opaque bytes.
     pub routing: Vec<u8>,
+    /// Presence tint (0xRRGGBB) and the color it had before, if tinted.
+    #[serde(default)]
+    pub color: u32,
 }
 
 impl Default for FakeTrack {
     fn default() -> Self {
-        Self { name: String::new(), kind: LaneKind::Part, devices: BTreeMap::new(), volume: 1.0, pan: 0.0, mute: false, clips: BTreeMap::new(), tone_hz: 440.0, routing: vec![] }
+        Self { name: String::new(), kind: TrackKind::Part, devices: BTreeMap::new(), volume: 1.0, pan: 0.0, mute: false, clips: BTreeMap::new(), tone_hz: 440.0, routing: vec![], color: 0x808080 }
     }
 }
 
@@ -58,17 +60,29 @@ pub struct FakeHost {
     pub tempo: f64,
     pub playing: bool,
     pub position: SongPos,
-    pub tracks: BTreeMap<LaneId, FakeTrack>,
+    pub tracks: BTreeMap<TrackId, FakeTrack>,
     /// Plugins "installed" in this fake DAW.
     pub installed: BTreeSet<PluginIdentity>,
     pub files: Vec<PathBuf>,
     queue: Vec<HostEvent>,
     /// Params the core set on us (for assertions).
-    pub applied: Vec<(LaneId, DeviceSlot, ParamId, f32)>,
-    pub applied_mixer: Vec<(LaneId, MixerChange)>,
+    pub applied: Vec<(TrackId, DeviceSlot, ParamId, f32)>,
+    pub applied_mixer: Vec<(TrackId, MixerChange)>,
     pub applied_transport: Vec<TransportChange>,
-    pub applied_host_state: Vec<(LaneId, Vec<u8>)>,
+    pub applied_host_state: Vec<(TrackId, Vec<u8>)>,
     pub renders: usize,
+    /// Plugins actually loaded into a slot by `set_device` (a slot that
+    /// already held the plugin counts nothing).
+    pub device_loads: usize,
+    pub device_removals: usize,
+    /// Project files loaded through `load_snapshot`.
+    pub snapshot_loads: usize,
+    /// Other beings shown in the DAW right now.
+    pub shown: Vec<Shown>,
+    /// Where `follow` took us.
+    pub followed: Vec<PresencePayload>,
+    /// Original colors of tinted tracks, to restore.
+    tinted: BTreeMap<TrackId, u32>,
 }
 
 impl FakeHost {
@@ -88,6 +102,12 @@ impl FakeHost {
             applied_transport: vec![],
             applied_host_state: vec![],
             renders: 0,
+            device_loads: 0,
+            device_removals: 0,
+            snapshot_loads: 0,
+            shown: vec![],
+            followed: vec![],
+            tinted: BTreeMap::new(),
         }
     }
 
@@ -109,89 +129,89 @@ impl FakeHost {
         self.installed.insert(plugin);
     }
 
-    /// Add a track with a plugin in slot 0. Reported to the core as a lane.
-    pub fn add_track(&mut self, lane: &str, name: &str, kind: LaneKind, plugin: Option<PluginIdentity>, tone_hz: f32) {
+    /// Add a track with a plugin in slot 0. Reported to the core as a track.
+    pub fn add_track(&mut self, track: &str, name: &str, kind: TrackKind, plugin: Option<PluginIdentity>, tone_hz: f32) {
         let mut t = FakeTrack { name: name.to_string(), kind, tone_hz, ..Default::default() };
         if let Some(p) = plugin {
             self.installed.insert(p.clone());
             t.devices.insert(0, FakeDevice { plugin: p, params: BTreeMap::new() });
         }
-        self.tracks.insert(LaneId::new(lane), t);
+        self.tracks.insert(TrackId::new(track), t);
         if self.live() {
-            self.queue.push(HostEvent::LaneSeen { lane: LaneId::new(lane), name: name.to_string(), kind });
+            self.queue.push(HostEvent::TrackSeen { track: TrackId::new(track), name: name.to_string(), kind });
         }
     }
 
     /// The user drops a plugin into a slot (or replaces the one there).
-    pub fn add_device(&mut self, lane: &str, slot: DeviceSlot, plugin: PluginIdentity) {
-        let lane = LaneId::new(lane);
-        let Some(t) = self.tracks.get_mut(&lane) else { return };
+    pub fn add_device(&mut self, track: &str, slot: DeviceSlot, plugin: PluginIdentity) {
+        let track = TrackId::new(track);
+        let Some(t) = self.tracks.get_mut(&track) else { return };
         self.installed.insert(plugin.clone());
         t.devices.insert(slot.0, FakeDevice { plugin: plugin.clone(), params: BTreeMap::new() });
         if self.live() {
-            self.queue.push(HostEvent::DeviceChanged { lane, slot, plugin: Some(plugin), pos: self.position });
+            self.queue.push(HostEvent::DeviceChanged { track, slot, plugin: Some(plugin), pos: self.position });
         }
     }
 
     /// The user removes the plugin from a slot.
-    pub fn remove_device(&mut self, lane: &str, slot: DeviceSlot) {
-        let lane = LaneId::new(lane);
-        let Some(t) = self.tracks.get_mut(&lane) else { return };
+    pub fn remove_device(&mut self, track: &str, slot: DeviceSlot) {
+        let track = TrackId::new(track);
+        let Some(t) = self.tracks.get_mut(&track) else { return };
         if t.devices.remove(&slot.0).is_some() && self.live() {
-            self.queue.push(HostEvent::DeviceChanged { lane, slot, plugin: None, pos: self.position });
+            self.queue.push(HostEvent::DeviceChanged { track, slot, plugin: None, pos: self.position });
         }
     }
 
-    pub fn device(&self, lane: &str, slot: DeviceSlot) -> Option<&PluginIdentity> {
-        self.tracks.get(&LaneId::new(lane))?.devices.get(&slot.0).map(|d| &d.plugin)
+    pub fn device(&self, track: &str, slot: DeviceSlot) -> Option<&PluginIdentity> {
+        self.tracks.get(&TrackId::new(track))?.devices.get(&slot.0).map(|d| &d.plugin)
     }
 
     /// The user turns a knob. Reported live at level >= 1, silent at 0.
-    pub fn twist(&mut self, lane: &str, slot: DeviceSlot, param: &str, value: f32) {
-        let lane = LaneId::new(lane);
-        let Some(t) = self.tracks.get_mut(&lane) else { return };
+    pub fn twist(&mut self, track: &str, slot: DeviceSlot, param: &str, value: f32) {
+        let track = TrackId::new(track);
+        let Some(t) = self.tracks.get_mut(&track) else { return };
         let Some(d) = t.devices.get_mut(&slot.0) else { return };
         d.params.insert(ParamId::new(param), value);
         let plugin = d.plugin.clone();
         if self.live() {
-            self.queue.push(HostEvent::ParamChanged { lane, slot, plugin, param: ParamId::new(param), value, pos: self.position });
+            self.queue.push(HostEvent::ParamChanged { track, slot, plugin, param: ParamId::new(param), value, pos: self.position });
         }
     }
 
     /// Many small moves of one knob, like a real twist.
-    pub fn sweep(&mut self, lane: &str, slot: DeviceSlot, param: &str, from: f32, to: f32, steps: usize) {
+    pub fn sweep(&mut self, track: &str, slot: DeviceSlot, param: &str, from: f32, to: f32, steps: usize) {
         for i in 0..=steps {
             let v = from + (to - from) * i as f32 / steps as f32;
-            self.twist(lane, slot, param, v);
+            self.twist(track, slot, param, v);
         }
     }
 
-    pub fn set_volume(&mut self, lane: &str, v: f32) {
-        let lane = LaneId::new(lane);
-        if let Some(t) = self.tracks.get_mut(&lane) {
+    pub fn set_volume(&mut self, track: &str, v: f32) {
+        let track = TrackId::new(track);
+        if let Some(t) = self.tracks.get_mut(&track) {
             t.volume = v;
             if self.live() {
-                self.queue.push(HostEvent::MixerChanged { lane, change: MixerChange::Volume(v), pos: self.position });
+                self.queue.push(HostEvent::MixerChanged { track, change: MixerChange::Volume(v), pos: self.position });
             }
         }
     }
 
-    pub fn set_pan(&mut self, lane: &str, p: f32) {
-        let lane = LaneId::new(lane);
-        if let Some(t) = self.tracks.get_mut(&lane) {
+    pub fn set_pan(&mut self, track: &str, p: f32) {
+        let track = TrackId::new(track);
+        if let Some(t) = self.tracks.get_mut(&track) {
             t.pan = p;
             if self.live() {
-                self.queue.push(HostEvent::MixerChanged { lane, change: MixerChange::Pan(p), pos: self.position });
+                self.queue.push(HostEvent::MixerChanged { track, change: MixerChange::Pan(p), pos: self.position });
             }
         }
     }
 
-    pub fn set_mute(&mut self, lane: &str, m: bool) {
-        let lane = LaneId::new(lane);
-        if let Some(t) = self.tracks.get_mut(&lane) {
+    pub fn set_mute(&mut self, track: &str, m: bool) {
+        let track = TrackId::new(track);
+        if let Some(t) = self.tracks.get_mut(&track) {
             t.mute = m;
             if self.live() {
-                self.queue.push(HostEvent::MixerChanged { lane, change: MixerChange::Mute(m), pos: self.position });
+                self.queue.push(HostEvent::MixerChanged { track, change: MixerChange::Mute(m), pos: self.position });
             }
         }
     }
@@ -221,21 +241,22 @@ impl FakeHost {
         self.position = pos;
     }
 
-    pub fn write_notes(&mut self, lane: &str, clip: &str, notes: Vec<Note>) {
-        if let Some(t) = self.tracks.get_mut(&LaneId::new(lane)) {
+    pub fn write_notes(&mut self, track: &str, clip: &str, notes: Vec<Note>) {
+        if let Some(t) = self.tracks.get_mut(&TrackId::new(track)) {
             t.clips.insert(clip.to_string(), notes);
         }
     }
 
-    pub fn set_routing(&mut self, lane: &str, routing: Vec<u8>) {
-        if let Some(t) = self.tracks.get_mut(&LaneId::new(lane)) {
+    pub fn set_routing(&mut self, track: &str, routing: Vec<u8>) {
+        if let Some(t) = self.tracks.get_mut(&TrackId::new(track)) {
             t.routing = routing;
         }
     }
 
-    pub fn focus(&mut self, f: Focus) {
-        if self.level >= Level::Ai {
-            self.queue.push(HostEvent::FocusChanged(f));
+    /// The user looks at something: reported as (unsettled) presence.
+    pub fn focus(&mut self, view: View, track: Option<&str>, slot: Option<DeviceSlot>) {
+        if self.live() {
+            self.queue.push(HostEvent::Presence { presence: PresencePayload { view, track: track.map(TrackId::new), device: slot, region: None }, pos: Some(self.position) });
         }
     }
 
@@ -262,20 +283,28 @@ impl FakeHost {
         serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    pub fn param(&self, lane: &str, slot: DeviceSlot, param: &str) -> Option<f32> {
-        self.tracks.get(&LaneId::new(lane))?.devices.get(&slot.0)?.params.get(&ParamId::new(param)).copied()
+    pub fn param(&self, track: &str, slot: DeviceSlot, param: &str) -> Option<f32> {
+        self.tracks.get(&TrackId::new(track))?.devices.get(&slot.0)?.params.get(&ParamId::new(param)).copied()
+    }
+
+    pub fn color(&self, track: &str) -> Option<u32> {
+        self.tracks.get(&TrackId::new(track)).map(|t| t.color)
     }
 
     /// What the plugin sitting on a track would capture at the print point
     /// (post inserts, fader, pan; pre sends). Works at every level: this is
     /// the plugin's own capture, not a bridge render.
-    pub fn capture(&self, lane: &str, from: SongPos, to: SongPos) -> Option<RenderedAudio> {
-        let t = self.tracks.get(&LaneId::new(lane))?;
+    pub fn capture(&self, track: &str, from: SongPos, to: SongPos) -> Option<RenderedAudio> {
+        let t = self.tracks.get(&TrackId::new(track))?;
         Some(tone(t, from, to, self.tempo))
     }
 
     pub fn pending(&self) -> usize {
         self.queue.len()
+    }
+
+    fn track_mut(&mut self, track: &TrackId) -> &mut FakeTrack {
+        self.tracks.entry(track.clone()).or_insert_with(|| FakeTrack { name: track.0.clone(), ..Default::default() })
     }
 }
 
@@ -312,10 +341,14 @@ impl HostBridge for FakeHost {
                 set_mixer: true,
                 set_transport: true,
                 read_project: l >= Level::Project,
-                render_lane: true,
+                render_track: true,
                 honors_print_point: true,
                 host_state: true,
-                reports_focus: l >= Level::Ai,
+                report_presence: true,
+                show_presence: true,
+                follow: true,
+                read_state: true,
+                load_snapshot: true,
             },
         }
     }
@@ -328,58 +361,68 @@ impl HostBridge for FakeHost {
         self.live() && self.installed.contains(plugin)
     }
 
-    fn set_param(&mut self, lane: &LaneId, slot: DeviceSlot, plugin: &PluginIdentity, param: &ParamId, value: f32) -> ApplyOutcome {
+    fn set_param(&mut self, track: &TrackId, slot: DeviceSlot, plugin: &PluginIdentity, param: &ParamId, value: f32) -> ApplyOutcome {
         if !self.live() {
             return ApplyOutcome::Unsupported;
         }
         if !self.installed.contains(plugin) {
             return ApplyOutcome::NotAvailable;
         }
-        let t = self.tracks.entry(lane.clone()).or_insert_with(|| FakeTrack { name: lane.0.clone(), ..Default::default() });
+        let t = self.track_mut(track);
         let d = t.devices.entry(slot.0).or_insert_with(|| FakeDevice { plugin: plugin.clone(), params: BTreeMap::new() });
         if d.plugin != *plugin {
             d.plugin = plugin.clone();
             d.params.clear();
         }
         d.params.insert(param.clone(), value);
-        self.applied.push((lane.clone(), slot, param.clone(), value));
+        self.applied.push((track.clone(), slot, param.clone(), value));
         ApplyOutcome::Applied
     }
 
-    fn set_device(&mut self, lane: &LaneId, slot: DeviceSlot, plugin: Option<&PluginIdentity>) -> ApplyOutcome {
+    fn set_device(&mut self, track: &TrackId, slot: DeviceSlot, plugin: Option<&PluginIdentity>) -> ApplyOutcome {
         if !self.live() {
             return ApplyOutcome::Unsupported;
         }
-        let t = self.tracks.entry(lane.clone()).or_insert_with(|| FakeTrack { name: lane.0.clone(), ..Default::default() });
         match plugin {
             Some(p) => {
                 if !self.installed.contains(p) {
                     return ApplyOutcome::NotAvailable;
                 }
-                let d = t.devices.entry(slot.0).or_insert_with(|| FakeDevice { plugin: p.clone(), params: BTreeMap::new() });
-                if d.plugin != *p {
-                    d.plugin = p.clone();
-                    d.params.clear();
+                let t = self.track_mut(track);
+                match t.devices.get_mut(&slot.0) {
+                    Some(d) if d.plugin == *p => {}
+                    Some(d) => {
+                        d.plugin = p.clone();
+                        d.params.clear();
+                        self.device_loads += 1;
+                    }
+                    None => {
+                        t.devices.insert(slot.0, FakeDevice { plugin: p.clone(), params: BTreeMap::new() });
+                        self.device_loads += 1;
+                    }
                 }
             }
             None => {
-                t.devices.remove(&slot.0);
+                let t = self.track_mut(track);
+                if t.devices.remove(&slot.0).is_some() {
+                    self.device_removals += 1;
+                }
             }
         }
         ApplyOutcome::Applied
     }
 
-    fn set_mixer(&mut self, lane: &LaneId, change: &MixerChange) -> ApplyOutcome {
+    fn set_mixer(&mut self, track: &TrackId, change: &MixerChange) -> ApplyOutcome {
         if !self.live() {
             return ApplyOutcome::Unsupported;
         }
-        let t = self.tracks.entry(lane.clone()).or_insert_with(|| FakeTrack { name: lane.0.clone(), ..Default::default() });
+        let t = self.track_mut(track);
         match change {
             MixerChange::Volume(v) => t.volume = *v,
             MixerChange::Pan(p) => t.pan = *p,
             MixerChange::Mute(m) => t.mute = *m,
         }
-        self.applied_mixer.push((lane.clone(), change.clone()));
+        self.applied_mixer.push((track.clone(), change.clone()));
         ApplyOutcome::Applied
     }
 
@@ -404,47 +447,110 @@ impl HostBridge for FakeHost {
         }
         let p = Self::load_project(path).ok()?;
         let mut snap = ProjectSnapshot { tempo: Some(p.tempo), files: p.files.clone(), ..Default::default() };
-        for (lane, t) in &p.tracks {
+        for (track, t) in &p.tracks {
             for (clip, notes) in &t.clips {
-                snap.notes.push((LaneId::new(lane), clip.clone(), notes.clone()));
-                snap.arrangement.push((LaneId::new(lane), clip.clone(), SongPos::START));
+                snap.notes.push((TrackId::new(track), clip.clone(), notes.clone()));
+                snap.arrangement.push((TrackId::new(track), clip.clone(), SongPos::START));
             }
         }
         Some(snap)
     }
 
-    fn render_lane(&mut self, lane: &LaneId, from: SongPos, to: SongPos) -> Option<RenderedAudio> {
+    fn render_track(&mut self, track: &TrackId, from: SongPos, to: SongPos) -> Option<RenderedAudio> {
         if !self.live() {
             return None;
         }
         self.renders += 1;
-        let t = self.tracks.get(lane)?;
+        let t = self.tracks.get(track)?;
         Some(tone(t, from, to, self.tempo))
     }
 
-    fn capture_host_state(&mut self, lane: &LaneId) -> Option<Vec<u8>> {
+    fn capture_host_state(&mut self, track: &TrackId) -> Option<Vec<u8>> {
         if !self.live() {
             return None;
         }
-        let t = self.tracks.get(lane)?;
+        let t = self.tracks.get(track)?;
         if t.routing.is_empty() { None } else { Some(t.routing.clone()) }
     }
 
-    fn apply_host_state(&mut self, lane: &LaneId, blob: &[u8]) -> ApplyOutcome {
+    fn apply_host_state(&mut self, track: &TrackId, blob: &[u8]) -> ApplyOutcome {
         if !self.live() {
             return ApplyOutcome::Unsupported;
         }
-        let t = self.tracks.entry(lane.clone()).or_insert_with(|| FakeTrack { name: lane.0.clone(), ..Default::default() });
+        let t = self.track_mut(track);
         t.routing = blob.to_vec();
-        self.applied_host_state.push((lane.clone(), blob.to_vec()));
+        self.applied_host_state.push((track.clone(), blob.to_vec()));
         ApplyOutcome::Applied
     }
 
-    fn lanes(&self) -> Vec<LaneId> {
+    fn tracks(&self) -> Vec<TrackId> {
         self.tracks.keys().cloned().collect()
     }
 
     fn master_has_processing(&self) -> Option<bool> {
-        Some(self.tracks.get(&LaneId::new("mix")).map(|t| !t.devices.is_empty()).unwrap_or(false))
+        Some(self.tracks.values().find(|t| t.kind == TrackKind::Master).map(|t| !t.devices.is_empty()).unwrap_or(false))
+    }
+
+    fn show_presence(&mut self, shown: &[Shown]) -> ApplyOutcome {
+        if !self.live() {
+            return ApplyOutcome::Unsupported;
+        }
+        self.clear_presence();
+        for s in shown {
+            if let Some(track) = &s.presence.track {
+                if let Some(t) = self.tracks.get_mut(track) {
+                    self.tinted.entry(track.clone()).or_insert(t.color);
+                    t.color = s.color;
+                }
+            }
+        }
+        self.shown = shown.to_vec();
+        ApplyOutcome::Applied
+    }
+
+    fn clear_presence(&mut self) {
+        for (track, color) in std::mem::take(&mut self.tinted) {
+            if let Some(t) = self.tracks.get_mut(&track) {
+                t.color = color;
+            }
+        }
+        self.shown.clear();
+    }
+
+    fn follow(&mut self, presence: &PresencePayload) -> ApplyOutcome {
+        if !self.live() {
+            return ApplyOutcome::Unsupported;
+        }
+        self.followed.push(presence.clone());
+        ApplyOutcome::Applied
+    }
+
+    fn read_state(&mut self) -> Option<HostModel> {
+        if !self.live() {
+            return None;
+        }
+        let mut m = HostModel { tempo: Some(self.tempo), tracks: BTreeMap::new() };
+        for (id, t) in &self.tracks {
+            let devices = t.devices.iter().map(|(s, d)| (DeviceSlot(*s), HostDevice { plugin: d.plugin.clone(), params: d.params.clone() })).collect();
+            m.tracks.insert(id.clone(), HostTrack { devices, volume: Some(t.volume), pan: Some(t.pan), mute: Some(t.mute), host_state: if t.routing.is_empty() { None } else { Some(t.routing.clone()) } });
+        }
+        Some(m)
+    }
+
+    fn load_snapshot(&mut self, project: &Path) -> ApplyOutcome {
+        if !self.live() {
+            return ApplyOutcome::Unsupported;
+        }
+        let Ok(p) = Self::load_project(project) else { return ApplyOutcome::NotAvailable };
+        self.tempo = p.tempo;
+        self.tracks = p.tracks.into_iter().map(|(k, v)| (TrackId::new(&k), v)).collect();
+        for t in self.tracks.values() {
+            for d in t.devices.values() {
+                self.installed.insert(d.plugin.clone());
+            }
+        }
+        self.files = p.files;
+        self.snapshot_loads += 1;
+        ApplyOutcome::Applied
     }
 }

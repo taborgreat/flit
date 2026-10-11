@@ -15,5 +15,10 @@ tokio.workspace = true
 dirs.workspace = true
 tracing.workspace = true
 
+# Client::drop cancels the reader thread's blocking pipe read (a thread
+# still running when a DAW unloads the plugin crashes the DAW).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_IO"] }
+
 [dev-dependencies]
 tempfile.workspace = true

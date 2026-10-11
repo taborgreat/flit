@@ -3,8 +3,8 @@
 //! ParamChanged, set_param echo suppression, transport).
 use flit_bridge_fl::sysex::*;
 use flit_bridge_fl::*;
-use flit_core::{DeviceSlot, LaneId, MixerChange, ParamId, TransportChange};
-use flit_host::{ApplyOutcome, Baseline, HostBridge, HostEvent, Level};
+use flit_core::{DeviceSlot, MixerChange, ParamId, PresencePayload, TrackId, TransportChange, View};
+use flit_host::{ApplyOutcome, Baseline, HostBridge, HostEvent, Level, Shown, TrackKind};
 use std::sync::{Arc, Mutex};
 
 /// A MidiPort whose other end is a tiny FL stand-in.
@@ -47,11 +47,11 @@ impl MidiPort for Shared {
                 channels: fl.channels.clone(),
                 tracks: {
                     let mut v = vec![
-                        FlTrack { index: 0, name: "Master".into(), volume: 0.8, pan: 0.0, mute: false, slots: vec![] },
-                        FlTrack { index: 1, name: "Drums".into(), volume: fl.volume, pan: 0.0, mute: false, slots: fl.slots.clone().unwrap_or_else(|| vec![(0, "Fruity Limiter".into())]) },
+                        FlTrack { index: 0, name: "Master".into(), volume: 0.8, pan: 0.0, mute: false, slots: vec![], color: 0x111111 },
+                        FlTrack { index: 1, name: "Drums".into(), volume: fl.volume, pan: 0.0, mute: false, slots: fl.slots.clone().unwrap_or_else(|| vec![(0, "Fruity Limiter".into())]), color: 0x222222 },
                     ];
                     for (i, n, vol) in &fl.extra {
-                        v.push(FlTrack { index: *i, name: n.clone(), volume: *vol, pan: 0.0, mute: false, slots: vec![] });
+                        v.push(FlTrack { index: *i, name: n.clone(), volume: *vol, pan: 0.0, mute: false, slots: vec![], color: 0 });
                     }
                     v
                 },
@@ -118,10 +118,10 @@ fn hello_snapshot_scan_dirty_and_apply() {
     assert_eq!(b.capabilities().level, Level::LiveControl);
     assert!(!b.capabilities().honors_print_point, "FL cannot print post-fader without rerouting (VERIFY ON WINDOWS)");
     let evs = settle(&mut b);
-    // first pass: lanes seen (mix + drums), tempo learned; the first param
-    // scan is a baseline and produces no ParamChanged
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::LaneSeen { lane, kind: flit_core::LaneKind::Mix, .. } if lane.0 == "mix")));
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::LaneSeen { lane, name, .. } if lane.0 == "fl-track-1" && name == "Drums")));
+    // first pass: tracks seen (master + drums), tempo learned; the first
+    // param scan is a baseline and produces no ParamChanged
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::TrackSeen { track, kind: TrackKind::Master, .. } if track.0 == "fl-track-0")));
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::TrackSeen { track, name, .. } if track.0 == "fl-track-1" && name == "Drums")));
     assert!(evs.iter().any(|e| matches!(e, HostEvent::Transport { change: TransportChange::Tempo(t), .. } if *t == 128.0)));
     assert!(!evs.iter().any(|e| matches!(e, HostEvent::ParamChanged { .. })), "{evs:?}");
     assert!(b.script.is_some());
@@ -134,8 +134,8 @@ fn hello_snapshot_scan_dirty_and_apply() {
     let evs = settle(&mut b);
     let changed: Vec<&HostEvent> = evs.iter().filter(|e| matches!(e, HostEvent::ParamChanged { .. })).collect();
     assert_eq!(changed.len(), 1, "{evs:?}");
-    let HostEvent::ParamChanged { lane, slot, plugin, param, value, .. } = changed[0] else { panic!() };
-    assert_eq!(lane, &LaneId::new("fl-track-1"));
+    let HostEvent::ParamChanged { track, slot, plugin, param, value, .. } = changed[0] else { panic!() };
+    assert_eq!(track, &TrackId::new("fl-track-1"));
     assert_eq!(*slot, DeviceSlot(0));
     assert_eq!(plugin.name, "Fruity Limiter");
     assert_eq!(param, &ParamId::from_u32(1));
@@ -162,7 +162,7 @@ fn hello_snapshot_scan_dirty_and_apply() {
     assert!(bi < ci);
 
     // heartbeat: play state and tempo
-    event(&fl, &FlEvent::Heartbeat { playing: true, tempo: 128.0, pos_ticks: 960, changed: None, title: None, undo_count: None, undo_pos: None });
+    event(&fl, &FlEvent::Heartbeat { playing: true, tempo: 128.0, pos_ticks: 960, changed: None, title: None, undo_count: None, undo_pos: None, recording: None });
     let evs = settle(&mut b);
     assert!(evs.iter().any(|e| matches!(e, HostEvent::Transport { change: TransportChange::Play, pos } if pos.beats() == 10.0)));
     assert!(b.is_connected());
@@ -170,9 +170,9 @@ fn hello_snapshot_scan_dirty_and_apply() {
     // a peer's setting is applied through plugins.setParamValue and does
     // not echo back as our own change when FL reports dirty afterwards
     let plug = flit_core::PluginIdentity::new(flit_core::PluginFormat::Other("fl-wrapper".into()), "", "Fruity Limiter", "fl");
-    assert_eq!(b.set_param(&LaneId::new("fl-track-1"), DeviceSlot(0), &plug, &ParamId::from_u32(0), 0.75), ApplyOutcome::Applied);
+    assert_eq!(b.set_param(&TrackId::new("fl-track-1"), DeviceSlot(0), &plug, &ParamId::from_u32(0), 0.75), ApplyOutcome::Applied);
     let other = flit_core::PluginIdentity::vst3("Acme", "Comp", "1");
-    assert_eq!(b.set_param(&LaneId::new("fl-track-1"), DeviceSlot(0), &other, &ParamId::from_u32(0), 0.75), ApplyOutcome::NotAvailable);
+    assert_eq!(b.set_param(&TrackId::new("fl-track-1"), DeviceSlot(0), &other, &ParamId::from_u32(0), 0.75), ApplyOutcome::NotAvailable);
     settle(&mut b);
     assert!((fl.0.lock().unwrap().params[0].2 - 0.75).abs() < 1e-6);
     event(&fl, &FlEvent::Dirty { flags: 4096, tracks: vec![1], channels: vec![] });
@@ -181,7 +181,7 @@ fn hello_snapshot_scan_dirty_and_apply() {
 
     // transport/mixer/tempo out
     assert_eq!(b.set_transport(&TransportChange::Tempo(100.0)), ApplyOutcome::Applied);
-    assert_eq!(b.set_mixer(&LaneId::new("fl-track-1"), &MixerChange::Volume(1.0)), ApplyOutcome::Applied);
+    assert_eq!(b.set_mixer(&TrackId::new("fl-track-1"), &MixerChange::Volume(1.0)), ApplyOutcome::Applied);
     settle(&mut b);
     let f = fl.0.lock().unwrap();
     assert_eq!(f.tempo, 100.0);
@@ -210,23 +210,23 @@ fn heartbeat_detects_saves_and_project_switches() {
     assert_eq!(b.current_project(), None, "no title yet and no recent file on disk");
 
     // first title: just learn it, no Opened (the agent already knows the song)
-    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(1), title: Some("my song.flp * - FL Studio 2024".into()), undo_count: None, undo_pos: None });
+    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(1), title: Some("my song.flp * - FL Studio 2024".into()), undo_count: None, undo_pos: None, recording: None });
     let evs = settle(&mut b);
     assert!(!evs.iter().any(|e| matches!(e, HostEvent::ProjectSaved { .. } | HostEvent::ProjectOpened { .. })), "{evs:?}");
     assert_eq!(b.current_project(), Some(song.clone()));
 
     // changed 1 -> 0 on a fresh file = the user saved
-    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("my song.flp - FL Studio 2024".into()), undo_count: None, undo_pos: None });
+    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("my song.flp - FL Studio 2024".into()), undo_count: None, undo_pos: None, recording: None });
     let evs = settle(&mut b);
     assert!(evs.iter().any(|e| matches!(e, HostEvent::ProjectSaved { path, .. } if *path == song)), "{evs:?}");
     // staying at 0 is not another save
-    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("my song.flp - FL Studio 2024".into()), undo_count: None, undo_pos: None });
+    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("my song.flp - FL Studio 2024".into()), undo_count: None, undo_pos: None, recording: None });
     let evs = settle(&mut b);
     assert!(!evs.iter().any(|e| matches!(e, HostEvent::ProjectSaved { .. })), "{evs:?}");
 
     // another project: tracks forgotten, re-snapshot, ProjectOpened
     let before = fl.0.lock().unwrap().requests.iter().filter(|r| matches!(r, FlRequest::Snapshot)).count();
-    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("FL Studio 2024 - other.flp".into()), undo_count: None, undo_pos: None });
+    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("FL Studio 2024 - other.flp".into()), undo_count: None, undo_pos: None, recording: None });
     let evs = settle(&mut b);
     assert!(evs.iter().any(|e| matches!(e, HostEvent::ProjectOpened { path, .. } if *path == other)), "{evs:?}");
     assert!(fl.0.lock().unwrap().requests.iter().filter(|r| matches!(r, FlRequest::Snapshot)).count() > before);
@@ -246,7 +246,7 @@ fn heartbeat_detects_saves_and_project_switches() {
     let cfg = FlConfig { projects_dir: None, ..FlConfig::default() };
     let fl2 = Shared::default();
     let mut b2 = FlBridge::with_config(Box::new(fl2.clone()), cfg);
-    event(&fl2, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("other.flp - FL Studio 2024".into()), undo_count: None, undo_pos: None });
+    event(&fl2, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: Some(0), title: Some("other.flp - FL Studio 2024".into()), undo_count: None, undo_pos: None, recording: None });
     settle(&mut b2);
     assert_eq!(b2.current_project(), Some(other.clone()));
     std::env::remove_var("FLIT_FL_RECENT");
@@ -300,9 +300,11 @@ fn device_changes_unused_tracks_and_scan_errors() {
     }
     let mut b = FlBridge::new(Box::new(fl.clone()));
     let evs = settle(&mut b);
-    let seen: Vec<String> = evs.iter().filter_map(|e| match e { HostEvent::LaneSeen { lane, .. } => Some(lane.0.clone()), _ => None }).collect();
-    assert_eq!(seen, vec!["mix", "fl-track-1", "fl-track-7"], "Insert 5 (default name, unity, no plugins) is not a lane yet: {seen:?}");
-    assert!(!evs.iter().any(|e| matches!(e, HostEvent::DeviceChanged { .. })), "the first snapshot is the baseline");
+    let seen: Vec<String> = evs.iter().filter_map(|e| match e { HostEvent::TrackSeen { track, .. } => Some(track.0.clone()), _ => None }).collect();
+    assert_eq!(seen, vec!["fl-track-0", "fl-track-1", "fl-track-7"], "Insert 5 (default name, unity, no plugins) is not a track yet: {seen:?}");
+    // the plugins already in use are announced too; the live loop stamps
+    // only what the song does not know yet
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::DeviceChanged { track, slot, plugin: Some(p), .. } if track.0 == "fl-track-1" && *slot == DeviceSlot(0) && p.name == "Fruity Limiter")), "{evs:?}");
 
     // the user drops a compressor into slot 2 of Drums
     fl.0.lock().unwrap().slots = Some(vec![(0, "Fruity Limiter".into()), (1, "Fruity Compressor".into())]);
@@ -310,25 +312,25 @@ fn device_changes_unused_tracks_and_scan_errors() {
     let evs = settle(&mut b);
     let dev: Vec<&HostEvent> = evs.iter().filter(|e| matches!(e, HostEvent::DeviceChanged { .. })).collect();
     assert_eq!(dev.len(), 1, "{evs:?}");
-    let HostEvent::DeviceChanged { lane, slot, plugin, .. } = dev[0] else { panic!() };
-    assert_eq!(lane, &LaneId::new("fl-track-1"));
+    let HostEvent::DeviceChanged { track, slot, plugin, .. } = dev[0] else { panic!() };
+    assert_eq!(track, &TrackId::new("fl-track-1"));
     assert_eq!(*slot, DeviceSlot(1));
     assert_eq!(plugin.as_ref().map(|p| p.name.as_str()), Some("Fruity Compressor"));
     // set_device: matching slot = nothing to do; "removed" = the slot is switched
     // off (FL cannot delete plugins) with a notice; back again = switched on;
     // a plugin FL does not have is a step for the user
     let comp = plugin.clone().unwrap();
-    assert_eq!(b.set_device(&LaneId::new("fl-track-1"), DeviceSlot(1), Some(&comp)), ApplyOutcome::Applied);
-    assert_eq!(b.set_device(&LaneId::new("fl-track-1"), DeviceSlot(1), None), ApplyOutcome::Applied, "bypassed instead");
+    assert_eq!(b.set_device(&TrackId::new("fl-track-1"), DeviceSlot(1), Some(&comp)), ApplyOutcome::Applied);
+    assert_eq!(b.set_device(&TrackId::new("fl-track-1"), DeviceSlot(1), None), ApplyOutcome::Applied, "bypassed instead");
     let evs = settle(&mut b);
     assert!(fl.0.lock().unwrap().requests.iter().any(|r| matches!(r, FlRequest::SetSlotEnabled { track: 1, slot: 1, value: false })), "slot switched off");
     assert!(evs.iter().any(|e| matches!(e, HostEvent::Notice(t) if t.contains("switched off"))), "{evs:?}");
-    assert_eq!(b.set_device(&LaneId::new("fl-track-1"), DeviceSlot(1), Some(&comp)), ApplyOutcome::Applied, "and on again");
+    assert_eq!(b.set_device(&TrackId::new("fl-track-1"), DeviceSlot(1), Some(&comp)), ApplyOutcome::Applied, "and on again");
     settle(&mut b);
     assert!(fl.0.lock().unwrap().requests.iter().any(|r| matches!(r, FlRequest::SetSlotEnabled { track: 1, slot: 1, value: true })));
-    assert_eq!(b.set_device(&LaneId::new("fl-track-1"), DeviceSlot(4), None), ApplyOutcome::Applied, "empty stays empty");
+    assert_eq!(b.set_device(&TrackId::new("fl-track-1"), DeviceSlot(4), None), ApplyOutcome::Applied, "empty stays empty");
     let other = flit_core::PluginIdentity::new(flit_core::PluginFormat::Other("fl-wrapper".into()), "", "Fruity Reeverb 2", "fl");
-    assert_eq!(b.set_device(&LaneId::new("fl-track-1"), DeviceSlot(4), Some(&other)), ApplyOutcome::Unsupported, "FL cannot load it");
+    assert_eq!(b.set_device(&TrackId::new("fl-track-1"), DeviceSlot(4), Some(&other)), ApplyOutcome::Unsupported, "FL cannot load it");
     assert!(!b.capabilities().set_devices);
 
     // the user removes it again
@@ -341,8 +343,8 @@ fn device_changes_unused_tracks_and_scan_errors() {
     fl.0.lock().unwrap().extra[0].2 = 0.5;
     event(&fl, &FlEvent::Dirty { flags: 4, tracks: vec![5], channels: vec![] });
     let evs = settle(&mut b);
-    let li = evs.iter().position(|e| matches!(e, HostEvent::LaneSeen { lane, .. } if lane.0 == "fl-track-5")).expect("announced: {evs:?}");
-    let mi = evs.iter().position(|e| matches!(e, HostEvent::MixerChanged { lane, .. } if lane.0 == "fl-track-5")).expect("fader change");
+    let li = evs.iter().position(|e| matches!(e, HostEvent::TrackSeen { track, .. } if track.0 == "fl-track-5")).expect("announced: {evs:?}");
+    let mi = evs.iter().position(|e| matches!(e, HostEvent::MixerChanged { track, .. } if track.0 == "fl-track-5")).expect("fader change");
     assert!(li < mi);
 
     // a scan that errors ends instead of hanging
@@ -351,7 +353,7 @@ fn device_changes_unused_tracks_and_scan_errors() {
     event(&fl, &FlEvent::Dirty { flags: 4, tracks: vec![1], channels: vec![] });
     let _ = settle(&mut b);
     let n_before = fl.0.lock().unwrap().requests.iter().filter(|r| matches!(r, FlRequest::Params { slot: 2, .. })).count();
-    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: None, title: None, undo_count: None, undo_pos: None });
+    event(&fl, &FlEvent::Heartbeat { playing: false, tempo: 120.0, pos_ticks: 0, changed: None, title: None, undo_count: None, undo_pos: None, recording: None });
     let _ = settle(&mut b);
     let n_after = fl.0.lock().unwrap().requests.iter().filter(|r| matches!(r, FlRequest::Params { slot: 2, .. })).count();
     assert_eq!(n_before, n_after, "no retry storm after an error");
@@ -362,7 +364,7 @@ fn device_changes_unused_tracks_and_scan_errors() {
 /// slot 0 (params scanned with FL slot -1), a swapped generator is a Device
 /// fact, the channel's own volume is the lane's fader.
 #[test]
-fn channels_are_lanes_with_their_generator_as_slot_zero() {
+fn channels_are_tracks_with_their_generator_as_slot_zero() {
     let fl = Shared::default();
     {
         let mut f = fl.0.lock().unwrap();
@@ -370,26 +372,26 @@ fn channels_are_lanes_with_their_generator_as_slot_zero() {
         f.volume = 0.8;
         f.params = vec![(0, "Cutoff".into(), 0.3)];
         f.channels = vec![
-            FlChannel { index: 0, name: "Kick".into(), plugin: None, insert: 1, volume: 0.78125, pan: 0.0, mute: false },
-            FlChannel { index: 1, name: "Lead".into(), plugin: Some("Sytrus".into()), insert: 2, volume: 0.78125, pan: 0.0, mute: false },
+            FlChannel { index: 0, name: "Kick".into(), plugin: None, insert: 1, volume: 0.78125, pan: 0.0, mute: false, color: 0 },
+            FlChannel { index: 1, name: "Lead".into(), plugin: Some("Sytrus".into()), insert: 2, volume: 0.78125, pan: 0.0, mute: false, color: 0 },
         ];
     }
     let mut b = FlBridge::new(Box::new(fl.clone()));
     let evs = settle(&mut b);
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::LaneSeen { lane, name, .. } if lane.0 == "fl-channel-1" && name == "Lead")), "{evs:?}");
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::LaneSeen { lane, .. } if lane.0 == "fl-channel-0")));
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::TrackSeen { track, name, .. } if track.0 == "fl-channel-1" && name == "Lead")), "{evs:?}");
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::TrackSeen { track, .. } if track.0 == "fl-channel-0")));
     assert!(fl.0.lock().unwrap().requests.iter().any(|r| matches!(r, FlRequest::Params { track: 1, slot: -1, .. })), "generator params scanned with slot -1");
     assert!(!fl.0.lock().unwrap().requests.iter().any(|r| matches!(r, FlRequest::Params { track: 0, slot: -1, .. })), "a sampler has no plugin to scan");
-    assert!(b.lanes().contains(&LaneId::new("fl-channel-1")));
+    assert!(b.tracks().contains(&TrackId::new("fl-channel-1")));
 
     // a knob on the generator
     fl.0.lock().unwrap().params[0].2 = 0.9;
     event(&fl, &FlEvent::Dirty { flags: 4096, tracks: vec![], channels: vec![1] });
     let evs = settle(&mut b);
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::ParamChanged { lane, slot, plugin, .. } if lane.0 == "fl-channel-1" && *slot == DeviceSlot(0) && plugin.name == "Sytrus")), "{evs:?}");
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::ParamChanged { track, slot, plugin, .. } if track.0 == "fl-channel-1" && *slot == DeviceSlot(0) && plugin.name == "Sytrus")), "{evs:?}");
     // a peer's setting for it goes to FL slot -1
     let plug = flit_core::PluginIdentity::new(flit_core::PluginFormat::Other("fl-wrapper".into()), "", "Sytrus", "fl");
-    assert_eq!(b.set_param(&LaneId::new("fl-channel-1"), DeviceSlot(0), &plug, &ParamId::from_u32(0), 0.4), ApplyOutcome::Applied);
+    assert_eq!(b.set_param(&TrackId::new("fl-channel-1"), DeviceSlot(0), &plug, &ParamId::from_u32(0), 0.4), ApplyOutcome::Applied);
     settle(&mut b);
     assert!(fl.0.lock().unwrap().requests.iter().any(|r| matches!(r, FlRequest::SetParam { track: 1, slot: -1, param: 0, .. })));
 
@@ -401,16 +403,16 @@ fn channels_are_lanes_with_their_generator_as_slot_zero() {
     }
     event(&fl, &FlEvent::Dirty { flags: 4096, tracks: vec![], channels: vec![1] });
     let evs = settle(&mut b);
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::DeviceChanged { lane, slot, plugin: Some(p), .. } if lane.0 == "fl-channel-1" && *slot == DeviceSlot(0) && p.name == "Serum")), "{evs:?}");
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::MixerChanged { lane, change: MixerChange::Volume(g), .. } if lane.0 == "fl-channel-1" && (g - 0.5).abs() < 1e-6)), "{evs:?}");
-    assert_eq!(b.set_mixer(&LaneId::new("fl-channel-1"), &MixerChange::Volume(1.0)), ApplyOutcome::Applied);
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::DeviceChanged { track, slot, plugin: Some(p), .. } if track.0 == "fl-channel-1" && *slot == DeviceSlot(0) && p.name == "Serum")), "{evs:?}");
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::MixerChanged { track, change: MixerChange::Volume(g), .. } if track.0 == "fl-channel-1" && (g - 0.5).abs() < 1e-6)), "{evs:?}");
+    assert_eq!(b.set_mixer(&TrackId::new("fl-channel-1"), &MixerChange::Volume(1.0)), ApplyOutcome::Applied);
     settle(&mut b);
     assert!(fl.0.lock().unwrap().requests.iter().any(|r| matches!(r, FlRequest::SetChanVolume { chan: 1, value } if (value - 0.78125).abs() < 1e-6)));
     // deleting the channel empties its generator slot
     fl.0.lock().unwrap().channels.truncate(1);
     event(&fl, &FlEvent::Dirty { flags: 4096, tracks: vec![], channels: vec![] });
     let evs = settle(&mut b);
-    assert!(evs.iter().any(|e| matches!(e, HostEvent::DeviceChanged { lane, plugin: None, .. } if lane.0 == "fl-channel-1")), "{evs:?}");
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::DeviceChanged { track, plugin: None, .. } if track.0 == "fl-channel-1")), "{evs:?}");
     // save goes through FL's own Save command
     assert_eq!(b.request_save(), ApplyOutcome::Applied);
     settle(&mut b);
@@ -418,12 +420,12 @@ fn channels_are_lanes_with_their_generator_as_slot_zero() {
 }
 
 #[test]
-fn lane_mapping_and_gain_law() {
-    assert_eq!(FlBridge::lane_for_track(0), LaneId::new("mix"));
-    assert_eq!(FlBridge::lane_for_track(7), LaneId::new("fl-track-7"));
-    assert_eq!(FlBridge::track_for_lane(&LaneId::new("fl-track-7")), Some(7));
-    assert_eq!(FlBridge::track_for_lane(&LaneId::new("mix")), Some(0));
-    assert_eq!(FlBridge::track_for_lane(&LaneId::new("vox")), None);
+fn track_mapping_and_gain_law() {
+    assert_eq!(FlBridge::track_for_index(0), TrackId::new("fl-track-0"));
+    assert_eq!(FlBridge::track_for_index(7), TrackId::new("fl-track-7"));
+    assert_eq!(FlBridge::index_for_track(&TrackId::new("fl-track-7")), Some(7));
+    assert_eq!(FlBridge::index_for_track(&TrackId::new("fl-track-0")), Some(0));
+    assert_eq!(FlBridge::index_for_track(&TrackId::new("vox")), None);
     assert!((bridge::fl_to_gain(0.8) - 1.0).abs() < 1e-6);
     assert!((bridge::gain_to_fl(0.5) - 0.4).abs() < 1e-6);
 }
@@ -443,8 +445,8 @@ fn flp_snapshot_maps_to_host_neutral() {
     let snap = flp::to_snapshot(&s);
     assert_eq!(snap.tempo, Some(140.0));
     assert_eq!(snap.notes.len(), 1);
-    let (lane, clip, notes) = &snap.notes[0];
-    assert_eq!(lane, &LaneId::new("fl-channel-0"), "notes belong to the channel's own lane");
+    let (track, clip, notes) = &snap.notes[0];
+    assert_eq!(track, &TrackId::new("fl-channel-0"), "notes belong to the channel's own track");
     assert_eq!(clip, "Beat");
     assert_eq!(notes[0].start.beats(), 1.0);
     assert_eq!(notes[0].length_ticks, 480);
@@ -463,4 +465,168 @@ fn flp_helper_on_sample_file_if_python_available() {
     let snap = flp::read_project(&python, &sample).expect("helper runs");
     assert_eq!(snap.tempo, Some(140.0));
     assert_eq!(snap.notes.iter().map(|(_, _, n)| n.len()).sum::<usize>(), 2);
+}
+
+/// Presence: the script's focus reports become Presence events (only on
+/// change); other beings are shown as track tints that are restored on
+/// clear and before a save; follow selects the track and opens the window.
+#[test]
+fn presence_tints_and_follow() {
+    let fl = Shared::default();
+    {
+        let mut f = fl.0.lock().unwrap();
+        f.tempo = 120.0;
+        f.volume = 0.8;
+        f.channels = vec![FlChannel { index: 2, name: "Lead".into(), plugin: Some("Sytrus".into()), insert: 2, volume: 0.78125, pan: 0.0, mute: false, color: 0x00AA00 }];
+    }
+    let mut b = FlBridge::new(Box::new(fl.clone()));
+    settle(&mut b);
+    assert!(b.capabilities().report_presence && b.capabilities().show_presence && b.capabilities().follow && b.capabilities().read_state);
+    event(&fl, &FlEvent::Focus { focus: "mixer".into(), track: 1, slot: -1, channel: None });
+    event(&fl, &FlEvent::Focus { focus: "mixer".into(), track: 1, slot: -1, channel: None });
+    event(&fl, &FlEvent::Focus { focus: "plugin".into(), track: 1, slot: 0, channel: None });
+    event(&fl, &FlEvent::Focus { focus: "piano_roll".into(), track: -1, slot: -1, channel: Some(2) });
+    let evs = settle(&mut b);
+    let pres: Vec<PresencePayload> = evs.iter().filter_map(|e| match e { HostEvent::Presence { presence, .. } => Some(presence.clone()), _ => None }).collect();
+    assert_eq!(pres.len(), 3, "the repeated focus is not reported twice: {pres:?}");
+    assert_eq!((pres[0].view, pres[0].track.clone()), (View::Mixer, Some(TrackId::new("fl-track-1"))));
+    assert_eq!((pres[1].view, pres[1].device), (View::Device, Some(DeviceSlot(0))));
+    assert_eq!((pres[2].view, pres[2].track.clone()), (View::Notes, Some(TrackId::new("fl-channel-2"))));
+
+    // show Bob on Drums and Carol on the Lead channel
+    let bob = flit_core::BeingRef { name: flit_core::Keypair::from_seed(2).id(), being: flit_core::BeingId::new("bob") };
+    let carol = flit_core::BeingRef { name: flit_core::Keypair::from_seed(3).id(), being: flit_core::BeingId::new("carol") };
+    let shown = vec![
+        Shown { being: bob, label: "Bob".into(), color: 0xE07A5F, presence: PresencePayload { view: View::Mixer, track: Some(TrackId::new("fl-track-1")), device: None, region: None } },
+        Shown { being: carol, label: "Carol".into(), color: 0x4FB286, presence: PresencePayload { view: View::Notes, track: Some(TrackId::new("fl-channel-2")), device: None, region: None } },
+    ];
+    assert_eq!(b.show_presence(&shown), ApplyOutcome::Applied);
+    settle(&mut b);
+    {
+        let f = fl.0.lock().unwrap();
+        assert!(f.requests.iter().any(|r| matches!(r, FlRequest::SetTrackColor { track: 1, color: 0xE07A5F })), "{:?}", f.requests);
+        assert!(f.requests.iter().any(|r| matches!(r, FlRequest::SetChannelColor { chan: 2, color: 0x4FB286 })));
+    }
+    // a snapshot while tinted keeps the original color on record
+    event(&fl, &FlEvent::Dirty { flags: 4, tracks: vec![1], channels: vec![] });
+    settle(&mut b);
+    b.clear_presence();
+    settle(&mut b);
+    {
+        let f = fl.0.lock().unwrap();
+        assert!(f.requests.iter().any(|r| matches!(r, FlRequest::SetTrackColor { track: 1, color: 0x222222 })), "original restored: {:?}", f.requests);
+        assert!(f.requests.iter().any(|r| matches!(r, FlRequest::SetChannelColor { chan: 2, color: 0x00AA00 })));
+    }
+    // tints are stripped before a save
+    assert_eq!(b.show_presence(&shown[..1]), ApplyOutcome::Applied);
+    settle(&mut b);
+    let n = fl.0.lock().unwrap().requests.iter().filter(|r| matches!(r, FlRequest::SetTrackColor { track: 1, color: 0x222222 })).count();
+    assert_eq!(b.request_save(), ApplyOutcome::Applied);
+    settle(&mut b);
+    let f = fl.0.lock().unwrap();
+    let m = f.requests.iter().filter(|r| matches!(r, FlRequest::SetTrackColor { track: 1, color: 0x222222 })).count();
+    assert_eq!(m, n + 1, "restored before Save");
+    let restore_at = f.requests.iter().rposition(|r| matches!(r, FlRequest::SetTrackColor { track: 1, color: 0x222222 })).unwrap();
+    let save_at = f.requests.iter().rposition(|r| matches!(r, FlRequest::Save)).unwrap();
+    assert!(restore_at < save_at);
+    drop(f);
+    // follow
+    assert_eq!(b.follow(&shown[1].presence), ApplyOutcome::Applied);
+    settle(&mut b);
+    let f = fl.0.lock().unwrap();
+    assert!(f.requests.iter().any(|r| matches!(r, FlRequest::SelectChannel { chan: 2 })));
+    assert!(f.requests.iter().any(|r| matches!(r, FlRequest::ShowWindow { window } if window == "piano_roll")));
+    drop(f);
+    // the DAW's state in model form
+    let m = b.read_state().unwrap();
+    assert_eq!(m.tempo, Some(120.0));
+    assert!(m.tracks.contains_key(&TrackId::new("fl-track-1")));
+    assert_eq!(m.tracks[&TrackId::new("fl-channel-2")].devices[&DeviceSlot(0)].plugin.name, "Sytrus");
+}
+
+/// Notes and clips live only in the project file (FL's API has no note
+/// read). After piano-roll or playlist edits the bridge waits for a pause,
+/// has FL save quietly, and the file's notes sync without a Version. A
+/// recording pass ending does the same. Nothing is saved while playing,
+/// and Save version still makes a Version.
+#[test]
+fn notes_edits_make_a_quiet_save_and_notes_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let song = dir.path().join("keys.flp");
+    std::fs::write(&song, b"flp").unwrap();
+    let fl = Shared::default();
+    {
+        let mut f = fl.0.lock().unwrap();
+        f.tempo = 120.0;
+        f.volume = 0.8;
+        f.channels = vec![FlChannel { index: 0, name: "Keys".into(), plugin: Some("FL Keys".into()), insert: 1, volume: 0.78125, pan: 0.0, mute: false, color: 0 }];
+    }
+    let cfg = FlConfig { projects_dir: Some(dir.path().to_path_buf()), notes_settle: std::time::Duration::ZERO, ..FlConfig::default() };
+    let mut b = FlBridge::with_config(Box::new(fl.clone()), cfg);
+    let evs = settle(&mut b);
+    // a channel that arrives with its instrument: the song learns the device
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::DeviceChanged { track, slot, plugin: Some(p), .. } if track.0 == "fl-channel-0" && *slot == DeviceSlot(0) && p.name == "FL Keys")), "{evs:?}");
+    let saves = |fl: &Shared| fl.0.lock().unwrap().requests.iter().filter(|r| matches!(r, FlRequest::Save)).count();
+    let hb = |playing: bool, changed: i32, undo: i32, recording: bool| FlEvent::Heartbeat { playing, tempo: 120.0, pos_ticks: 0, changed: Some(changed), title: Some("keys.flp * - FL Studio 2024".into()), undo_count: Some(undo), undo_pos: Some(undo), recording: Some(recording) };
+
+    event(&fl, &hb(false, 1, 1, false));
+    settle(&mut b);
+    assert_eq!(saves(&fl), 0);
+    // a knob undo step with the mixer focused is not a notes edit
+    event(&fl, &FlEvent::Focus { focus: "mixer".into(), track: 1, slot: -1, channel: Some(0) });
+    event(&fl, &hb(false, 1, 2, false));
+    settle(&mut b);
+    assert_eq!(saves(&fl), 0, "mixer edits are live already");
+    // notes drawn in the piano roll: an undo step while it is focused
+    event(&fl, &FlEvent::Focus { focus: "piano_roll".into(), track: -1, slot: -1, channel: Some(0) });
+    event(&fl, &hb(false, 1, 3, false));
+    let evs = settle(&mut b);
+    assert_eq!(saves(&fl), 1, "quiet save after the edit rested");
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::Notice(t) if t.contains("notes"))), "told once: {evs:?}");
+    // FL wrote the file: changed flag back to 0 = notes only, no Version
+    std::fs::write(&song, b"flp2").unwrap();
+    event(&fl, &hb(false, 0, 3, false));
+    let evs = settle(&mut b);
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::NotesChanged { path, .. } if *path == song)), "{evs:?}");
+    assert!(!evs.iter().any(|e| matches!(e, HostEvent::ProjectSaved { .. })), "{evs:?}");
+    assert!(!evs.iter().any(|e| matches!(e, HostEvent::Notice(_))), "the notice came once");
+
+    // edits while playing wait for the stop (the snapshot reports the
+    // transport too, so the fake FL must agree with its heartbeat)
+    fl.0.lock().unwrap().playing = true;
+    event(&fl, &hb(true, 1, 4, false));
+    settle(&mut b);
+    assert_eq!(saves(&fl), 1, "never save while playing");
+    fl.0.lock().unwrap().playing = false;
+    event(&fl, &hb(false, 1, 4, false));
+    settle(&mut b);
+    assert_eq!(saves(&fl), 2);
+    std::fs::write(&song, b"flp3").unwrap();
+    event(&fl, &hb(false, 0, 4, false));
+    settle(&mut b);
+
+    // a recording pass: record on, play, stop = a take ended (no undo step needed)
+    event(&fl, &FlEvent::Focus { focus: "playlist".into(), track: -1, slot: -1, channel: Some(0) });
+    fl.0.lock().unwrap().playing = true;
+    event(&fl, &hb(true, 1, 4, true));
+    settle(&mut b);
+    assert_eq!(saves(&fl), 2);
+    fl.0.lock().unwrap().playing = false;
+    event(&fl, &hb(false, 1, 4, true));
+    settle(&mut b);
+    assert_eq!(saves(&fl), 3, "the take is in the file now");
+    std::fs::write(&song, b"flp4").unwrap();
+    event(&fl, &hb(false, 0, 4, true));
+    let evs = settle(&mut b);
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::NotesChanged { .. })), "{evs:?}");
+
+    // the user's own save (or Save version) is still a Version
+    event(&fl, &hb(false, 1, 5, false));
+    assert_eq!(b.request_save(), ApplyOutcome::Applied);
+    settle(&mut b);
+    std::fs::write(&song, b"flp5").unwrap();
+    event(&fl, &hb(false, 0, 5, false));
+    let evs = settle(&mut b);
+    assert!(evs.iter().any(|e| matches!(e, HostEvent::ProjectSaved { path, .. } if *path == song)), "{evs:?}");
+    assert!(!evs.iter().any(|e| matches!(e, HostEvent::NotesChanged { .. })), "{evs:?}");
 }

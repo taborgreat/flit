@@ -1,64 +1,19 @@
 //! The plugin's worker thread: owns the IPC client, moves audio between the
-//! rings and the agent, keeps a snapshot of agent state for the GUI, and
-//! reconnects (starting the agent if needed) whenever the agent is gone.
+//! rings and the helper, keeps `flit_ui::Shared` current for the compact
+//! panel, and reconnects (starting the FLit app if needed) whenever it is
+//! gone. The non-audio half (pushes, actions, status) is `flit_ui::client`.
 
 use crate::engine::{Mode, Rings};
 use crate::FlitParams;
-use atomic_float::AtomicF64;
-use flit_core::{LaneId, SongPos, TransportChange};
+use flit_core::{SongPos, TrackId, TransportChange};
 use flit_ipc::*;
-use parking_lot::Mutex;
-use std::collections::VecDeque;
+use flit_ui::client::{handle_push, on_connected, refresh_timeline, run_actions, StatusPoll, REFERENCE_KEY};
+use flit_ui::compact::is_master;
+pub use flit_ui::Shared;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-#[derive(Default)]
-pub struct TransportAtomics {
-    pub playing: AtomicBool,
-    pub tempo: AtomicF64,
-    pub pos_beats: AtomicF64,
-}
-
-impl TransportAtomics {
-    pub fn store(&self, playing: bool, tempo: f64, pos_beats: f64) {
-        self.playing.store(playing, Ordering::Relaxed);
-        self.tempo.store(tempo, Ordering::Relaxed);
-        self.pos_beats.store(pos_beats, Ordering::Relaxed);
-    }
-}
-
-/// What the GUI reads and the worker writes (and the GUI's action queue).
-#[derive(Default)]
-pub struct Shared {
-    pub connected: AtomicBool,
-    pub transport: TransportAtomics,
-    pub status: Mutex<Option<Status>>,
-    pub history: Mutex<Vec<flit_core::HistoryRow>>,
-    pub chat: Mutex<Vec<ChatRow>>,
-    pub branches: Mutex<Vec<BranchInfo>>,
-    pub songs: Mutex<Vec<(String, PathBuf)>>,
-    pub friends: Mutex<Vec<Friend>>,
-    pub preview: Mutex<Option<PreviewInfo>>,
-    pub last_error: Mutex<Option<String>>,
-    pub notices: Mutex<VecDeque<String>>,
-    pub actions: Mutex<VecDeque<Request>>,
-    pub connect_error: Mutex<Option<String>>,
-}
-
-impl Shared {
-    pub fn act(&self, r: Request) {
-        self.actions.lock().push_back(r);
-    }
-    pub fn notice(&self, s: impl Into<String>) {
-        let mut n = self.notices.lock();
-        n.push_back(s.into());
-        while n.len() > 50 {
-            n.pop_front();
-        }
-    }
-}
+use std::time::Duration;
 
 pub struct Worker {
     stop: Arc<AtomicBool>,
@@ -86,29 +41,44 @@ impl Drop for Worker {
     }
 }
 
-/// Where the agent executable is: FLIT_AGENT, then the per-user install
-/// location, then PATH.
-pub fn agent_exe() -> PathBuf {
+/// What to start when no helper answers: FLIT_AGENT, else the installed
+/// FLit app (in the background: its window opens on demand), else the
+/// headless helper, else whatever PATH finds.
+pub fn agent_exe() -> (PathBuf, Vec<String>) {
     if let Ok(p) = std::env::var("FLIT_AGENT") {
-        return PathBuf::from(p);
+        return (PathBuf::from(p), vec![]);
     }
-    let name = if cfg!(windows) { "flit-agent.exe" } else { "flit-agent" };
+    let (app, agent) = if cfg!(windows) { ("flit-app.exe", "flit-agent.exe") } else { ("flit-app", "flit-agent") };
     if let Some(d) = dirs::data_local_dir() {
-        let p = d.join("flit").join("bin").join(name);
-        if p.is_file() {
-            return p;
+        let bin = d.join("flit").join("bin");
+        if bin.join(app).is_file() {
+            return (bin.join(app), vec!["--background".into()]);
+        }
+        if bin.join(agent).is_file() {
+            return (bin.join(agent), vec![]);
         }
     }
-    PathBuf::from(name)
+    (PathBuf::from(agent), vec![])
 }
 
-fn client_kind(mode: Mode, lane: &str) -> ClientKind {
-    let lane_id = LaneId::new(if lane.trim().is_empty() { "lane" } else { lane.trim() });
+/// The track id this instance speaks for. "master" (any case) on a Track or
+/// Receiver is the session link: the reference mix.
+fn track_id(track: &str) -> TrackId {
+    let t = track.trim();
+    if t.is_empty() {
+        TrackId::new("track")
+    } else if is_master(t) {
+        TrackId::new("master")
+    } else {
+        TrackId::new(t)
+    }
+}
+
+fn client_kind(mode: Mode, track: &str) -> ClientKind {
     match mode {
-        Mode::Master => ClientKind::Panel,
-        Mode::Lane => ClientKind::Lane { lane: lane_id },
-        Mode::Receiver => ClientKind::Receiver { lane: lane_id },
-        Mode::TalkSend => ClientKind::TalkSend { name: lane.trim().to_string(), to: vec![] },
+        Mode::Track => ClientKind::Track { track: track_id(track) },
+        Mode::Receiver => ClientKind::Receiver { track: track_id(track) },
+        Mode::TalkSend => ClientKind::TalkSend { name: track.trim().to_string(), to: vec![] },
         Mode::TalkReceive => ClientKind::TalkReceive { from: None },
     }
 }
@@ -118,9 +88,11 @@ fn run(mut rings: Rings, shared: Arc<Shared>, params: Arc<FlitParams>, sample_ra
     let mut buf: Vec<f32> = Vec::with_capacity(sample_rate as usize * channels as usize);
     while !stop.load(Ordering::SeqCst) {
         let mode = params.mode.value();
-        let lane = params.lane.read().clone();
-        let kind = client_kind(mode, &lane);
-        let opts = ClientOptions { kind: kind.clone(), sample_rate, channels, agent_exe: Some(agent_exe()), connect_timeout: Duration::from_secs(5), ..ClientOptions::new(ClientKind::Cli) };
+        let track = params.track.read().clone();
+        shared.master.store(is_master(&track), Ordering::Relaxed);
+        let kind = client_kind(mode, &track);
+        let (exe, args) = agent_exe();
+        let opts = ClientOptions { kind: kind.clone(), sample_rate, channels, agent_exe: Some(exe), agent_args: args, connect_timeout: Duration::from_secs(5), ..ClientOptions::new(ClientKind::Cli) };
         let mut client = match Client::connect_or_start(&opts) {
             Ok(c) => c,
             Err(e) => {
@@ -134,37 +106,31 @@ fn run(mut rings: Rings, shared: Arc<Shared>, params: Arc<FlitParams>, sample_ra
             }
         };
         backoff = Duration::from_millis(250);
-        shared.connected.store(true, Ordering::SeqCst);
-        *shared.connect_error.lock() = None;
-        shared.notice("Connected to FLit helper");
-        if let Ok(Response::Status(s)) = client.request(Request::Status) {
-            *shared.status.lock() = Some(s);
-        }
-        session(&mut client, &mut rings, &shared, &params, &mut buf, sample_rate, channels, &stop, mode, &lane);
+        on_connected(&mut client, &shared);
+        session(&mut client, &mut rings, &shared, &params, &mut buf, sample_rate, channels, &stop, mode, &track);
         shared.connected.store(false, Ordering::SeqCst);
         if !stop.load(Ordering::SeqCst) {
-            shared.notice("Lost the FLit helper; reconnecting…");
+            shared.notice("Lost FLit; reconnecting");
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn session(client: &mut Client, rings: &mut Rings, shared: &Shared, params: &FlitParams, buf: &mut Vec<f32>, sample_rate: u32, channels: u8, stop: &AtomicBool, mode: Mode, lane: &str) {
+fn session(client: &mut Client, rings: &mut Rings, shared: &Shared, params: &FlitParams, buf: &mut Vec<f32>, sample_rate: u32, channels: u8, stop: &AtomicBool, mode: Mode, track: &str) {
     let mut last_playing = shared.transport.playing.load(Ordering::Relaxed);
     let mut last_tempo = 0.0f64;
-    let mut last_status = Instant::now();
-    let my_lane = LaneId::new(if lane.trim().is_empty() { "lane" } else { lane.trim() });
-    let sends_lane = matches!(mode, Mode::Lane | Mode::Master);
+    let mut poll = StatusPoll::default();
+    let my_track = track_id(track);
+    let master = is_master(track) && matches!(mode, Mode::Track | Mode::Receiver);
     loop {
         if stop.load(Ordering::SeqCst) {
-            let _ = client;
             return;
         }
         if !client.is_alive() {
             return;
         }
-        // mode or lane changed: reconnect with the right Hello
-        if params.mode.value() != mode || params.lane.read().as_str() != lane {
+        // mode or track changed: reconnect with the right Hello
+        if params.mode.value() != mode || params.track.read().as_str() != track {
             return;
         }
         let pos = SongPos::from_beats(shared.transport.pos_beats.load(Ordering::Relaxed));
@@ -179,21 +145,22 @@ fn session(client: &mut Client, rings: &mut Rings, shared: &Shared, params: &Fli
             }
         }
         if !buf.is_empty() {
-            let r = if sends_lane {
-                let lane_id = if mode == Mode::Master { LaneId::new(flit_core::song::MIX_LANE) } else { my_lane.clone() };
-                client.send(Request::Audio { lane: lane_id, pos, pcm: buf.clone() })
-            } else if mode == Mode::TalkSend {
-                client.send(Request::TalkAudio { pcm: buf.clone() })
-            } else {
-                Ok(())
+            let r = match mode {
+                Mode::Track => {
+                    let id = if master { TrackId::new(REFERENCE_KEY) } else { my_track.clone() };
+                    client.send(Request::Audio { track: id, pos, pcm: buf.clone() })
+                }
+                Mode::TalkSend => client.send(Request::TalkAudio { pcm: buf.clone() }),
+                _ => Ok(()),
             };
             if r.is_err() {
                 return;
             }
         }
 
-        // 2. transport (Master reports its host's transport for level 0)
-        if mode == Mode::Master {
+        // 2. transport: Track instances report the host's transport for
+        // level 0 (the helper stamps a change once, whoever says it first)
+        if mode == Mode::Track {
             let playing = shared.transport.playing.load(Ordering::Relaxed);
             let tempo = shared.transport.tempo.load(Ordering::Relaxed);
             if playing != last_playing {
@@ -206,15 +173,12 @@ fn session(client: &mut Client, rings: &mut Rings, shared: &Shared, params: &Fli
             }
         }
 
-        // 3. pushes
+        // 3. pushes: audio into the rings, the rest into Shared
+        let mut timeline_dirty = false;
         while let Some(p) = client.try_push() {
             match p {
-                Push::LaneAudio { lane: l, pcm } => {
-                    let wanted = match mode {
-                        Mode::Receiver => l == my_lane || l.0 == "__submix",
-                        Mode::Master => l.0 == flit_core::song::MIX_LANE && params.hear_reference.value(),
-                        _ => false,
-                    };
+                Push::TrackAudio { track: t, pcm } => {
+                    let wanted = mode == Mode::Receiver && (t == my_track || t.0 == "__submix" || (master && t.0 == REFERENCE_KEY));
                     if wanted {
                         for s in pcm {
                             let _ = rings.play.push(s);
@@ -228,68 +192,21 @@ fn session(client: &mut Client, rings: &mut Rings, shared: &Shared, params: &Fli
                         }
                     }
                 }
-                Push::Status(s) => *shared.status.lock() = Some(s),
-                Push::Row(r) => {
-                    let mut h = shared.history.lock();
-                    if !h.iter().any(|x| x.id == r.id) {
-                        h.push(r);
-                    }
-                }
-                Push::Chat(c) => {
-                    let mut ch = shared.chat.lock();
-                    if !ch.iter().any(|x| x.id == c.id) {
-                        ch.push(c);
-                    }
-                }
-                Push::JoinRequest { id, name } => shared.notice(format!("{name} ({}) asks to join", id.short_code())),
-                Push::Invite { from, name, .. } => shared.notice(format!("{} invited you to \"{name}\"", from.short_code())),
-                Push::Rejected { from, reason } => shared.notice(format!("Rejected from {}: {reason}", from.short_code())),
-                Push::Warning(w) => shared.notice(w),
+                other => timeline_dirty |= handle_push(shared, other),
             }
+        }
+        if timeline_dirty {
+            refresh_timeline(client, shared);
         }
 
         // 4. GUI actions
-        let actions: Vec<Request> = shared.actions.lock().drain(..).collect();
-        for req in actions {
-            let refresh_history = matches!(req, Request::GoBack { .. } | Request::NewBranch { .. } | Request::Undo { .. } | Request::BringIn { .. } | Request::SwitchBranch { .. } | Request::SaveVersion { .. } | Request::ClaimLane { .. } | Request::OpenSong { .. } | Request::NewSong { .. } | Request::ShareProject { .. } | Request::JoinWithCode { .. } | Request::AcceptInvite { .. });
-            match client.request_timeout(req, Duration::from_secs(130)) {
-                Ok(Response::Error(e)) => *shared.last_error.lock() = Some(e),
-                Ok(Response::Status(s)) => *shared.status.lock() = Some(s),
-                Ok(Response::History(h)) => *shared.history.lock() = h,
-                Ok(Response::Chat(c)) => *shared.chat.lock() = c,
-                Ok(Response::Branches(l)) => *shared.branches.lock() = l,
-                Ok(Response::Songs(s)) => *shared.songs.lock() = s,
-                Ok(Response::Friends(f)) => *shared.friends.lock() = f,
-                Ok(Response::Preview(p)) => *shared.preview.lock() = Some(p),
-                Ok(Response::Code(c)) => shared.notice(format!("Song code: {c}")),
-                Ok(_) => {}
-                Err(e) => {
-                    *shared.last_error.lock() = Some(e.to_string());
-                    return;
-                }
-            }
-            if refresh_history {
-                if let Ok(Response::Status(s)) = client.request(Request::Status) {
-                    let branch = s.song.as_ref().map(|x| x.branch).unwrap_or_else(flit_core::stamp::main_branch);
-                    *shared.status.lock() = Some(s);
-                    if let Ok(Response::History(h)) = client.request(Request::History { branch }) {
-                        *shared.history.lock() = h;
-                    }
-                    if let Ok(Response::Branches(l)) = client.request(Request::Branches) {
-                        *shared.branches.lock() = l;
-                    }
-                }
-            }
+        if run_actions(client, shared).is_err() {
+            return;
         }
 
         // 5. periodic status
-        if last_status.elapsed() > Duration::from_secs(3) {
-            last_status = Instant::now();
-            match client.request_timeout(Request::Status, Duration::from_secs(5)) {
-                Ok(Response::Status(s)) => *shared.status.lock() = Some(s),
-                Err(_) => return,
-                _ => {}
-            }
+        if poll.tick(client, shared).is_err() {
+            return;
         }
         std::thread::sleep(Duration::from_millis(5));
     }

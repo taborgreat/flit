@@ -1,12 +1,15 @@
 //! `FlBridge`: the `HostBridge` for FL Studio, speaking the SysEx protocol
-//! to `device_FLit.py` through a `MidiPort`. Level 1 (live control) is the
-//! target for session 2; level 2 (project read) goes through the PyFLP
-//! helper when the project path is known.
+//! to `device_FLit.py` through a `MidiPort`. Level 1 (live control) is
+//! verified; level 2 (project read) goes through the PyFLP helper when the
+//! project path is known. Presence: the script reports the focused window
+//! / selected track and channel; the bridge tints tracks in visitors'
+//! colors (restored afterwards) and can select tracks / open windows to
+//! follow someone.
 
-use crate::midi::MidiPort;
+use crate::port::MidiPort;
 use crate::sysex::*;
-use flit_core::{DeviceSlot, HostTag, LaneId, LaneKind, MixerChange, ParamId, PluginFormat, PluginIdentity, SongPos, TransportChange, TICKS_PER_BEAT};
-use flit_host::{ApplyOutcome, Baseline, Capabilities, Focus, HostBridge, HostEvent, Level, ProjectSnapshot, RenderedAudio};
+use flit_core::{DeviceSlot, HostTag, MixerChange, ParamId, PluginFormat, PluginIdentity, PresencePayload, SongPos, TrackId, TransportChange, View, TICKS_PER_BEAT};
+use flit_host::{ApplyOutcome, Baseline, Capabilities, HostBridge, HostDevice, HostEvent, HostModel, HostTrack, Level, ProjectSnapshot, RenderedAudio, Shown, TrackKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -25,31 +28,40 @@ pub const MAX_SCAN_PARAM: u32 = 1024; // VERIFY ON WINDOWS: named params beyond 
 
 #[derive(Clone, Debug)]
 pub struct FlConfig {
-    pub in_port: String,
-    pub out_port: String,
+    /// Base name of the virtual MIDI port FL talks over (`port.rs`).
+    pub port: String,
     /// Where the .flp files live, to find the project file from the window
     /// title (FL's API does not expose the path). VERIFY ON WINDOWS.
     pub projects_dir: Option<PathBuf>,
     /// `python` executable with pyflp for level-2 reads (see flp.rs).
     pub python: Option<PathBuf>,
     pub request_timeout: Duration,
+    /// Notes and clips can only be read from the project file (FL's API has
+    /// no note read). With this on, the bridge has FL save quietly once the
+    /// user pauses after piano-roll / playlist edits or a recording pass, so
+    /// the notes reach the song while people work. Off = notes land on
+    /// Save version and the user's own saves only.
+    pub quiet_save: bool,
+    /// How long notes edits must rest before the quiet save.
+    pub notes_settle: Duration,
 }
 
 impl Default for FlConfig {
     fn default() -> Self {
         Self {
-            in_port: crate::midi::DEFAULT_IN_PORT.into(),
-            out_port: crate::midi::DEFAULT_OUT_PORT.into(),
+            port: crate::port::DEFAULT_PORT.into(),
             projects_dir: dirs_projects(),
             python: None,
             request_timeout: Duration::from_millis(1500),
+            quiet_save: true,
+            notes_settle: Duration::from_secs(3),
         }
     }
 }
 
 fn dirs_projects() -> Option<PathBuf> {
     // Default FL projects folder on Windows. VERIFY ON WINDOWS.
-    std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Documents").join("Image-Branch").join("FL Studio").join("Projects"))
+    std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Documents").join("Image-Line").join("FL Studio").join("Projects"))
 }
 
 /// What we last saw of one plugin slot.
@@ -74,8 +86,9 @@ struct TrackState {
     volume: f32,
     pan: f32,
     mute: bool,
+    color: u32,
     slots: BTreeMap<i32, SlotState>,
-    /// Reported to the core as a lane (only tracks in use are; an unused
+    /// Reported to the core as a track (only tracks in use are; an unused
     /// insert is announced the moment something happens on it).
     announced: bool,
     /// Which mixer controls have had a change reported (see `reported`).
@@ -84,8 +97,8 @@ struct TrackState {
     mute_reported: bool,
 }
 
-/// A channel-rack channel as a lane: its generator is device slot 0, its
-/// own volume/pan/mute are the lane's mixer values.
+/// A channel-rack channel as a track: its generator is device slot 0, its
+/// own volume/pan/mute are the track's mixer values.
 #[derive(Clone, Debug, Default)]
 struct ChanState {
     name: String,
@@ -94,6 +107,7 @@ struct ChanState {
     volume: f32,
     pan: f32,
     mute: bool,
+    color: u32,
     slot: SlotState,
     announced: bool,
     vol_reported: bool,
@@ -139,8 +153,26 @@ pub struct FlBridge {
     last_hello: Option<Instant>,
     /// Filled by applying peer settings so our own re-read does not echo them.
     suppress: HashMap<(i32, i32, u32), f32>,
-    /// Lanes seen by the agent as "FL track i".
-    lane_names: HashMap<LaneId, i32>,
+    /// Presence tints we put on tracks / channels: (original color).
+    tinted_tracks: HashMap<i32, u32>,
+    tinted_channels: HashMap<i32, u32>,
+    /// The last presence reported, to report only changes.
+    last_presence: Option<PresencePayload>,
+    /// The focused FL window from the last Focus event ("piano_roll", ...).
+    focus: String,
+    /// FL's record button, from the heartbeat.
+    recording: bool,
+    /// Notes or clips were edited (undo step with the piano roll / playlist
+    /// focused, or a recording pass ended) and not yet saved: when.
+    notes_dirty: Option<Instant>,
+    /// A quiet save is in flight: the next "changed flag back to 0" is
+    /// NotesChanged, not a Version.
+    quiet_save_sent: bool,
+    quiet_save_noticed: bool,
+    /// Save version asked FL to save (when): that save is a Version even if
+    /// notes edits arrive meanwhile. Forgotten after a minute (Save As
+    /// cancelled, untitled project).
+    version_save_at: Option<Instant>,
 }
 
 impl FlBridge {
@@ -174,31 +206,31 @@ impl FlBridge {
             project_cache: None,
             last_hello: None,
             suppress: HashMap::new(),
-            lane_names: HashMap::new(),
+            tinted_tracks: HashMap::new(),
+            tinted_channels: HashMap::new(),
+            last_presence: None,
+            focus: String::new(),
+            recording: false,
+            notes_dirty: None,
+            quiet_save_sent: false,
+            quiet_save_noticed: false,
+            version_save_at: None,
         };
         b.queue.push_back(FlRequest::Hello { protocol: PROTOCOL_VERSION });
         b.queue.push_back(FlRequest::Snapshot);
         b
     }
 
-    /// Open the real loopMIDI ports (Windows). Fails when the ports are not
-    /// there (loopMIDI not running) and on other platforms, so the agent can
-    /// fall back to plugin-only mode.
+    /// Open the virtual MIDI port (`port.rs`) and the bridge on it. Fails
+    /// when the port is not there, and off Windows, so the app can fall
+    /// back to plugin-only mode.
     pub fn open_default() -> std::io::Result<Self> {
         Self::open_with_config(FlConfig::default())
     }
 
     pub fn open_with_config(cfg: FlConfig) -> std::io::Result<Self> {
-        #[cfg(windows)]
-        {
-            let port = crate::midi::real::MidirPort::open(&cfg.in_port, &cfg.out_port).map_err(std::io::Error::other)?;
-            return Ok(Self::with_config(Box::new(port), cfg));
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = cfg;
-            Err(std::io::Error::other("the FL Studio bridge runs on Windows (loopMIDI ports)"))
-        }
+        let wire = crate::port::open_platform(&cfg.port).map_err(std::io::Error::other)?;
+        Ok(Self::with_config(Box::new(wire), cfg))
     }
 
     pub fn is_connected(&self) -> bool {
@@ -209,32 +241,25 @@ impl FlBridge {
         self.tempo
     }
 
-    /// Lane id for an FL mixer track. Stable across sessions as long as
-    /// the track index is (FL has no track UUIDs). VERIFY ON WINDOWS: FL
-    /// moves tracks? Then names should drive the mapping instead.
-    pub fn lane_for_track(track: i32) -> LaneId {
-        if track == 0 {
-            LaneId::new(flit_core::song::MIX_LANE)
-        } else {
-            LaneId::new(&format!("fl-track-{track}"))
-        }
+    /// Track id for an FL mixer track (0 = Master). Stable across sessions
+    /// as long as the track index is (FL has no track UUIDs). VERIFY ON
+    /// WINDOWS: FL moves tracks? Then names should drive the mapping instead.
+    pub fn track_for_index(track: i32) -> TrackId {
+        TrackId::new(&format!("fl-track-{track}"))
     }
 
-    pub fn track_for_lane(lane: &LaneId) -> Option<i32> {
-        if lane.0 == flit_core::song::MIX_LANE {
-            return Some(0);
-        }
-        lane.0.strip_prefix("fl-track-").and_then(|n| n.parse().ok())
+    pub fn index_for_track(track: &TrackId) -> Option<i32> {
+        track.0.strip_prefix("fl-track-").and_then(|n| n.parse().ok())
     }
 
-    /// Lane id for a channel-rack channel (global index). Same stability
-    /// caveat as tracks: FL has no channel ids.
-    pub fn lane_for_channel(chan: i32) -> LaneId {
-        LaneId::new(&format!("fl-channel-{chan}"))
+    /// Track id for a channel-rack channel (global index). Same stability
+    /// caveat as mixer tracks: FL has no channel ids.
+    pub fn track_for_channel(chan: i32) -> TrackId {
+        TrackId::new(&format!("fl-channel-{chan}"))
     }
 
-    pub fn channel_for_lane(lane: &LaneId) -> Option<i32> {
-        lane.0.strip_prefix("fl-channel-").and_then(|n| n.parse().ok())
+    pub fn channel_for_track(track: &TrackId) -> Option<i32> {
+        track.0.strip_prefix("fl-channel-").and_then(|n| n.parse().ok())
     }
 
     fn plugin_identity(name: &str) -> PluginIdentity {
@@ -282,6 +307,63 @@ impl FlBridge {
         }
     }
 
+    /// Notes edits rested long enough and the transport is stopped: have FL
+    /// save, so the file (the only place FL shows its notes) is current.
+    /// The heartbeat's changed flag then turns into NotesChanged.
+    fn maybe_quiet_save(&mut self) {
+        let Some(since) = self.notes_dirty else { return };
+        if !self.cfg.quiet_save || self.version_save_pending() {
+            // off, or a Save version is on its way and covers the notes
+            self.notes_dirty = None;
+            return;
+        }
+        if since.elapsed() < self.cfg.notes_settle || self.playing || !self.is_connected() || self.quiet_save_sent {
+            return;
+        }
+        if self.queue.iter().any(|r| matches!(r, FlRequest::Save)) || self.pending.values().any(|p| matches!(p.req, FlRequest::Save)) {
+            return;
+        }
+        if self.project_path().is_none() {
+            // untitled project: FL would open Save As; wait for the user
+            return;
+        }
+        self.notes_dirty = None;
+        self.restore_colors();
+        self.queue.push_back(FlRequest::Save);
+        self.quiet_save_sent = true;
+        if !self.quiet_save_noticed {
+            self.quiet_save_noticed = true;
+            self.out.push(HostEvent::Notice("FLit saves your project a few seconds after you edit notes, so they reach the song. Save version still makes a version.".into()));
+        }
+    }
+
+    fn version_save_pending(&self) -> bool {
+        self.version_save_at.map(|t| t.elapsed() < Duration::from_secs(60)).unwrap_or(false)
+    }
+
+    fn presence_from(&self, focus: &str, track: i32, slot: i32, channel: Option<i32>) -> PresencePayload {
+        let mixer_track = if track >= 0 { Some(Self::track_for_index(track)) } else { None };
+        let chan_track = channel.filter(|c| *c >= 0).map(Self::track_for_channel);
+        match focus {
+            "plugin" => PresencePayload { view: View::Device, track: mixer_track.or(chan_track), device: if slot >= 0 { Some(DeviceSlot(slot as u32)) } else { None }, region: None },
+            "mixer" => PresencePayload { view: View::Mixer, track: mixer_track, device: None, region: None },
+            "piano_roll" => PresencePayload { view: View::Notes, track: chan_track, device: None, region: None },
+            "playlist" => PresencePayload { view: View::Arrange, track: None, device: None, region: None },
+            "channel_rack" => PresencePayload { view: View::Other, track: chan_track, device: None, region: Some("channel rack".into()) },
+            "browser" => PresencePayload { view: View::Browser, track: None, device: None, region: None },
+            _ => PresencePayload { view: View::Other, track: mixer_track.or(chan_track), device: None, region: None },
+        }
+    }
+
+    fn handle_focus(&mut self, focus: String, track: i32, slot: i32, channel: Option<i32>) {
+        let p = self.presence_from(&focus, track, slot, channel);
+        self.focus = focus;
+        if self.last_presence.as_ref() != Some(&p) {
+            self.last_presence = Some(p.clone());
+            self.out.push(HostEvent::Presence { presence: p, pos: Some(self.pos()) });
+        }
+    }
+
     fn handle_event(&mut self, ev: FlEvent) {
         match ev {
             FlEvent::Hello { api, fl, python } => {
@@ -289,17 +371,22 @@ impl FlBridge {
                 self.last_heartbeat = Some(Instant::now());
                 self.queue.push_back(FlRequest::Snapshot);
             }
-            FlEvent::Heartbeat { playing, tempo, pos_ticks, changed, title, undo_count, undo_pos } => {
+            FlEvent::Heartbeat { playing, tempo, pos_ticks, changed, title, undo_count, undo_pos, recording } => {
                 // A new undo step in FL = an edit happened somewhere. Treat it
                 // as a dirty hint so a re-read catches edits the flags missed.
+                // With the piano roll or playlist focused it is a notes / clip
+                // edit, which only the project file can tell us about.
                 if let (Some(c), Some(p)) = (undo_count, undo_pos) {
                     if c >= 0 {
                         let now = (c, p);
                         if let Some(prev) = self.last_undo {
                             if prev != now {
-                                tracing::debug!("FL undo history {prev:?} -> {now:?}");
+                                tracing::debug!("FL undo history {prev:?} -> {now:?} (focus {})", self.focus);
                                 self.dirty_all = true;
                                 self.queue.push_back(FlRequest::Snapshot);
+                                if matches!(self.focus.as_str(), "piano_roll" | "playlist") {
+                                    self.notes_dirty = Some(Instant::now());
+                                }
                             }
                         }
                         self.last_undo = Some(now);
@@ -314,6 +401,14 @@ impl FlBridge {
                 if playing != self.playing {
                     self.playing = playing;
                     self.out.push(HostEvent::Transport { change: if playing { TransportChange::Play } else { TransportChange::Stop }, pos: self.pos() });
+                    // Stop with the record button on = a take just ended; its
+                    // notes are in the project, not in the API.
+                    if !playing && self.recording {
+                        self.notes_dirty = Some(Instant::now());
+                    }
+                }
+                if let Some(r) = recording {
+                    self.recording = r;
                 }
                 // A new title = another project (open / new / save as).
                 if let Some(t) = title {
@@ -336,9 +431,14 @@ impl FlBridge {
                 // mtime on the file) is how saves become Versions.
                 if let Some(c) = changed {
                     if matches!(self.last_changed, Some(prev) if prev != 0) && c == 0 {
+                        // an asked-for save is a Version; only a save we started
+                        // for the notes alone is NotesChanged
+                        let quiet = std::mem::take(&mut self.quiet_save_sent) && !self.version_save_pending();
+                        self.version_save_at = None;
                         if let Some(path) = self.project_path() {
                             if recently_modified(&path) {
-                                self.out.push(HostEvent::ProjectSaved { path, pos: self.pos() });
+                                let pos = self.pos();
+                                self.out.push(if quiet { HostEvent::NotesChanged { path, pos } } else { HostEvent::ProjectSaved { path, pos } });
                             }
                         }
                     }
@@ -370,16 +470,7 @@ impl FlBridge {
                 }
                 self.project_switched();
             }
-            FlEvent::Focus { focus, track, slot } => {
-                let f = match focus.as_str() {
-                    "mixer" => Focus::Mixer,
-                    "piano_roll" => Focus::PianoRoll,
-                    "playlist" => Focus::Arrangement,
-                    "plugin" => Focus::PluginEditor { lane: Self::lane_for_track(track), slot: DeviceSlot(slot.max(0) as u32) },
-                    other => Focus::Other(other.to_string()),
-                };
-                self.out.push(HostEvent::FocusChanged(f));
-            }
+            FlEvent::Focus { focus, track, slot, channel } => self.handle_focus(focus, track, slot, channel),
             FlEvent::Log { text } => tracing::info!("FL script: {text}"),
         }
     }
@@ -419,68 +510,75 @@ impl FlBridge {
                 let pos = self.pos();
                 self.fold_channels(channels, dirty_all, &dirty_chans, pos);
                 for t in tracks {
-                    let lane = Self::lane_for_track(t.index);
+                    let track = Self::track_for_index(t.index);
+                    let kind = if t.index == 0 { TrackKind::Master } else { TrackKind::Part };
                     let is_new = !self.tracks.contains_key(&t.index);
+                    let tinted = self.tinted_tracks.contains_key(&t.index);
                     let st = self.tracks.entry(t.index).or_default();
                     if is_new {
                         // Verified on FL 24.1.1: trackCount() reports 127 (Master,
-                        // 125 inserts, one utility track); claiming all of them made
-                        // 126 lanes. Only tracks in use become lanes here; the rest
-                        // are announced when something first happens on them.
+                        // 125 inserts, one utility track); only tracks in use are
+                        // announced here; the rest when something first happens.
                         st.volume = t.volume;
                         st.pan = t.pan;
                         st.mute = t.mute;
                         st.name = t.name.clone();
-                        self.lane_names.insert(lane.clone(), t.index);
+                        st.color = t.color;
                         if track_in_use(&t) {
                             st.announced = true;
-                            let kind = if t.index == 0 { LaneKind::Mix } else { LaneKind::Part };
                             let name = if t.name.is_empty() { format!("Insert {}", t.index) } else { t.name.clone() };
-                            self.out.push(HostEvent::LaneSeen { lane: lane.clone(), name, kind });
+                            self.out.push(HostEvent::TrackSeen { track: track.clone(), name, kind });
+                            // same for the plugins already in its slots
+                            for (s, plugin) in &t.slots {
+                                self.out.push(HostEvent::DeviceChanged { track: track.clone(), slot: DeviceSlot((*s).max(0) as u32), plugin: Some(Self::plugin_identity(plugin)), pos });
+                            }
                         }
                     } else {
                         let changed = (t.volume - st.volume).abs() > 1e-4 || (t.pan - st.pan).abs() > 1e-4 || t.mute != st.mute || t.slots.iter().any(|(s, p)| st.slots.get(s).map(|x| x.plugin != *p).unwrap_or(true)) || st.slots.keys().any(|s| !t.slots.iter().any(|(x, _)| x == s));
                         if changed && !st.announced {
                             st.announced = true;
-                            let kind = if t.index == 0 { LaneKind::Mix } else { LaneKind::Part };
                             let name = if t.name.is_empty() { format!("Insert {}", t.index) } else { t.name.clone() };
-                            self.out.push(HostEvent::LaneSeen { lane: lane.clone(), name, kind });
+                            self.out.push(HostEvent::TrackSeen { track: track.clone(), name, kind });
                         }
                         // plugins added, replaced or removed since the last snapshot
                         let gone: Vec<i32> = st.slots.keys().filter(|s| !t.slots.iter().any(|(x, _)| x == *s)).copied().collect();
                         for s in gone {
                             st.slots.remove(&s);
-                            self.out.push(HostEvent::DeviceChanged { lane: lane.clone(), slot: DeviceSlot(s.max(0) as u32), plugin: None, pos });
+                            self.out.push(HostEvent::DeviceChanged { track: track.clone(), slot: DeviceSlot(s.max(0) as u32), plugin: None, pos });
                         }
                         for (s, plugin) in &t.slots {
                             let was = st.slots.get(s).map(|x| x.plugin.clone());
                             if was.as_deref() != Some(plugin.as_str()) {
-                                self.out.push(HostEvent::DeviceChanged { lane: lane.clone(), slot: DeviceSlot((*s).max(0) as u32), plugin: Some(Self::plugin_identity(plugin)), pos });
+                                self.out.push(HostEvent::DeviceChanged { track: track.clone(), slot: DeviceSlot((*s).max(0) as u32), plugin: Some(Self::plugin_identity(plugin)), pos });
                             }
                         }
                         if (t.volume - st.volume).abs() > 1e-4 {
                             if !st.vol_reported {
                                 st.vol_reported = true;
-                                self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { lane: lane.clone(), change: MixerChange::Volume(fl_to_gain(st.volume)) }, pos });
+                                self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { track: track.clone(), change: MixerChange::Volume(fl_to_gain(st.volume)) }, pos });
                             }
                             st.volume = t.volume;
-                            self.out.push(HostEvent::MixerChanged { lane: lane.clone(), change: MixerChange::Volume(fl_to_gain(t.volume)), pos });
+                            self.out.push(HostEvent::MixerChanged { track: track.clone(), change: MixerChange::Volume(fl_to_gain(t.volume)), pos });
                         }
                         if (t.pan - st.pan).abs() > 1e-4 {
                             if !st.pan_reported {
                                 st.pan_reported = true;
-                                self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { lane: lane.clone(), change: MixerChange::Pan(st.pan) }, pos });
+                                self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { track: track.clone(), change: MixerChange::Pan(st.pan) }, pos });
                             }
                             st.pan = t.pan;
-                            self.out.push(HostEvent::MixerChanged { lane: lane.clone(), change: MixerChange::Pan(t.pan), pos });
+                            self.out.push(HostEvent::MixerChanged { track: track.clone(), change: MixerChange::Pan(t.pan), pos });
                         }
                         if t.mute != st.mute {
                             if !st.mute_reported {
                                 st.mute_reported = true;
-                                self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { lane: lane.clone(), change: MixerChange::Mute(st.mute) }, pos });
+                                self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { track: track.clone(), change: MixerChange::Mute(st.mute) }, pos });
                             }
                             st.mute = t.mute;
-                            self.out.push(HostEvent::MixerChanged { lane: lane.clone(), change: MixerChange::Mute(t.mute), pos });
+                            self.out.push(HostEvent::MixerChanged { track: track.clone(), change: MixerChange::Mute(t.mute), pos });
+                        }
+                        // a tinted track keeps its original color on record
+                        if !tinted {
+                            st.color = t.color;
                         }
                     }
                     st.name = t.name.clone();
@@ -503,15 +601,15 @@ impl FlBridge {
             (FlRequest::Params { .. }, FlReply::Params { track, slot, total, next, params, .. }) => {
                 let pos = self.pos();
                 // slot -1 = the generator of channel `track`
-                let (ss, plugin, lane) = if slot == -1 {
+                let (ss, plugin, tid) = if slot == -1 {
                     let Some(cs) = self.channels.get_mut(&track) else { return };
                     let name = cs.plugin.clone().unwrap_or_default();
-                    (&mut cs.slot, Self::plugin_identity(&name), Self::lane_for_channel(track))
+                    (&mut cs.slot, Self::plugin_identity(&name), Self::track_for_channel(track))
                 } else {
                     let Some(ts) = self.tracks.get_mut(&track) else { return };
                     let Some(ss) = ts.slots.get_mut(&slot) else { return };
                     let plugin = Self::plugin_identity(&ss.plugin);
-                    (ss, plugin, Self::lane_for_track(track))
+                    (ss, plugin, Self::track_for_index(track))
                 };
                 for p in params {
                     let previous = ss.params.get(&p.index).map(|(_, old)| *old);
@@ -526,10 +624,10 @@ impl FlBridge {
                         let param = ParamId::from_u32(p.index);
                         if let Some(old) = previous {
                             if ss.reported.insert(p.index) {
-                                self.out.push(HostEvent::Baseline { baseline: Baseline::Param { lane: lane.clone(), slot: dslot, plugin: plugin.clone(), param: param.clone(), value: old }, pos });
+                                self.out.push(HostEvent::Baseline { baseline: Baseline::Param { track: tid.clone(), slot: dslot, plugin: plugin.clone(), param: param.clone(), value: old }, pos });
                             }
                         }
-                        self.out.push(HostEvent::ParamChanged { lane: lane.clone(), slot: dslot, plugin: plugin.clone(), param, value: p.value, pos });
+                        self.out.push(HostEvent::ParamChanged { track: tid.clone(), slot: dslot, plugin: plugin.clone(), param, value: p.value, pos });
                     }
                 }
                 let limit = total.min(MAX_SCAN_PARAM);
@@ -542,18 +640,19 @@ impl FlBridge {
                 }
             }
             (FlRequest::Title, FlReply::Title { title, .. }) => self.title = title,
-            (FlRequest::Focus, FlReply::Focus { focus, track, slot, .. }) => self.handle_event(FlEvent::Focus { focus, track, slot }),
+            (FlRequest::Focus, FlReply::Focus { focus, track, slot, channel, .. }) => self.handle_focus(focus, track, slot, channel),
             _ => {}
         }
     }
 
-    /// Fold a snapshot's channel list: new channels are lanes, generator
-    /// changes are Device facts, channel volume/pan/mute are mixer values.
+    /// Fold a snapshot's channel list: new channels are tracks, generator
+    /// changes are Device acts, channel volume/pan/mute are mixer values.
     fn fold_channels(&mut self, channels: Vec<FlChannel>, dirty_all: bool, dirty: &[i32], pos: SongPos) {
         let seen: Vec<i32> = channels.iter().map(|c| c.index).collect();
         for c in channels {
-            let lane = Self::lane_for_channel(c.index);
+            let track = Self::track_for_channel(c.index);
             let is_new = !self.channels.contains_key(&c.index);
+            let tinted = self.tinted_channels.contains_key(&c.index);
             let cs = self.channels.entry(c.index).or_default();
             if is_new {
                 cs.name = c.name.clone();
@@ -562,42 +661,51 @@ impl FlBridge {
                 cs.volume = c.volume;
                 cs.pan = c.pan;
                 cs.mute = c.mute;
+                cs.color = c.color;
                 cs.announced = true;
                 let name = if c.name.is_empty() { format!("Channel {}", c.index + 1) } else { c.name.clone() };
-                self.out.push(HostEvent::LaneSeen { lane: lane.clone(), name, kind: LaneKind::Part });
-                self.lane_names.insert(lane.clone(), c.index);
+                self.out.push(HostEvent::TrackSeen { track: track.clone(), name, kind: TrackKind::Part });
+                // A channel that arrives with its instrument in it (the user
+                // added FL Keys; the first snapshot): the song learns the
+                // device too. The live loop skips what the song already has.
+                if let Some(p) = &c.plugin {
+                    self.out.push(HostEvent::DeviceChanged { track: track.clone(), slot: DeviceSlot(0), plugin: Some(Self::plugin_identity(p)), pos });
+                }
             } else {
                 if cs.plugin != c.plugin {
                     cs.plugin = c.plugin.clone();
                     cs.slot = SlotState::default();
-                    self.out.push(HostEvent::DeviceChanged { lane: lane.clone(), slot: DeviceSlot(0), plugin: c.plugin.as_ref().map(|p| Self::plugin_identity(p)), pos });
+                    self.out.push(HostEvent::DeviceChanged { track: track.clone(), slot: DeviceSlot(0), plugin: c.plugin.as_ref().map(|p| Self::plugin_identity(p)), pos });
                 }
                 if (c.volume - cs.volume).abs() > 1e-4 {
                     if !cs.vol_reported {
                         cs.vol_reported = true;
-                        self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { lane: lane.clone(), change: MixerChange::Volume(chan_to_gain(cs.volume)) }, pos });
+                        self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { track: track.clone(), change: MixerChange::Volume(chan_to_gain(cs.volume)) }, pos });
                     }
                     cs.volume = c.volume;
-                    self.out.push(HostEvent::MixerChanged { lane: lane.clone(), change: MixerChange::Volume(chan_to_gain(c.volume)), pos });
+                    self.out.push(HostEvent::MixerChanged { track: track.clone(), change: MixerChange::Volume(chan_to_gain(c.volume)), pos });
                 }
                 if (c.pan - cs.pan).abs() > 1e-4 {
                     if !cs.pan_reported {
                         cs.pan_reported = true;
-                        self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { lane: lane.clone(), change: MixerChange::Pan(cs.pan) }, pos });
+                        self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { track: track.clone(), change: MixerChange::Pan(cs.pan) }, pos });
                     }
                     cs.pan = c.pan;
-                    self.out.push(HostEvent::MixerChanged { lane: lane.clone(), change: MixerChange::Pan(c.pan), pos });
+                    self.out.push(HostEvent::MixerChanged { track: track.clone(), change: MixerChange::Pan(c.pan), pos });
                 }
                 if c.mute != cs.mute {
                     if !cs.mute_reported {
                         cs.mute_reported = true;
-                        self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { lane: lane.clone(), change: MixerChange::Mute(cs.mute) }, pos });
+                        self.out.push(HostEvent::Baseline { baseline: Baseline::Mixer { track: track.clone(), change: MixerChange::Mute(cs.mute) }, pos });
                     }
                     cs.mute = c.mute;
-                    self.out.push(HostEvent::MixerChanged { lane: lane.clone(), change: MixerChange::Mute(c.mute), pos });
+                    self.out.push(HostEvent::MixerChanged { track: track.clone(), change: MixerChange::Mute(c.mute), pos });
                 }
                 cs.name = c.name.clone();
                 cs.insert = c.insert;
+                if !tinted {
+                    cs.color = c.color;
+                }
             }
             let want_scan = cs.plugin.is_some() && (dirty_all || dirty.contains(&c.index) || !cs.slot.scanned_once);
             if want_scan && cs.slot.scanning_from.is_none() {
@@ -610,7 +718,7 @@ impl FlBridge {
         for i in gone {
             if let Some(cs) = self.channels.remove(&i) {
                 if cs.plugin.is_some() {
-                    self.out.push(HostEvent::DeviceChanged { lane: Self::lane_for_channel(i), slot: DeviceSlot(0), plugin: None, pos });
+                    self.out.push(HostEvent::DeviceChanged { track: Self::track_for_channel(i), slot: DeviceSlot(0), plugin: None, pos });
                 }
             }
         }
@@ -621,6 +729,8 @@ impl FlBridge {
     fn project_switched(&mut self) {
         self.tracks.clear();
         self.channels.clear();
+        self.tinted_tracks.clear();
+        self.tinted_channels.clear();
         self.dirty_all = true;
         self.last_changed = None;
         self.queue.push_back(FlRequest::Snapshot);
@@ -632,7 +742,7 @@ impl FlBridge {
     /// The window title (`ui.getProgTitle()`) is the only hint FL's API
     /// gives about the open file; FL keeps the full paths of recent
     /// projects in the registry. Verified on FL 24.1.1 (Windows): the title
-    /// holds "name.flp", MRU lives under HKCU\Software\Image-Branch\FL Studio 24.
+    /// holds "name.flp", MRU lives under HKCU\Software\Image-Line\FL Studio 24.
     pub fn project_path(&self) -> Option<PathBuf> {
         let Some(name) = title_to_filename(&self.title) else {
             // Verified on FL 24.1.1: `ui.getProgTitle()` is just "FL Studio 2024",
@@ -650,6 +760,16 @@ impl FlBridge {
         }
         let p = dirs_projects()?.join(&name);
         if p.is_file() { Some(p) } else { None }
+    }
+
+    /// Put every tinted track / channel back to its own color.
+    fn restore_colors(&mut self) {
+        for (t, color) in std::mem::take(&mut self.tinted_tracks) {
+            self.queue.push_back(FlRequest::SetTrackColor { track: t, color });
+        }
+        for (c, color) in std::mem::take(&mut self.tinted_channels) {
+            self.queue.push_back(FlRequest::SetChannelColor { chan: c, color });
+        }
     }
 }
 
@@ -693,7 +813,7 @@ pub fn recent_projects() -> Vec<PathBuf> {
     {
         use winreg::enums::HKEY_CURRENT_USER;
         use winreg::RegKey;
-        let Ok(il) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Image-Branch") else { return vec![] };
+        let Ok(il) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Image-Line") else { return vec![] };
         let mut versions: Vec<(u32, String)> = il
             .enum_keys()
             .filter_map(|k| k.ok())
@@ -751,16 +871,23 @@ impl HostBridge for FlBridge {
             set_mixer: true,
             set_transport: true,
             read_project: self.cfg.python.is_some(),
-            // No quiet single-lane render through the API: the FLit plugin on
-            // the track captures its own output instead. VERIFY ON WINDOWS
-            // (Verify list: "Quiet way to render a single lane").
-            render_lane: false,
+            // No quiet single-track render through the API: the FLit plugin
+            // on the track captures its own output instead. VERIFY ON WINDOWS.
+            render_track: false,
             // FL applies fader/pan after the insert chain, so a plugin on the
             // track hears pre-fader audio: we cannot honor post-fader without
             // the user rerouting (or the bridge scaling by the fader). VERIFY ON WINDOWS.
             honors_print_point: false,
             host_state: false,
-            reports_focus: true,
+            report_presence: true,
+            // Track / channel colors as tints, restored afterwards. VERIFY ON
+            // WINDOWS: a tint must never end up in a saved project (see
+            // request_save; a save started inside FL cannot be intercepted).
+            show_presence: true,
+            follow: true,
+            read_state: true,
+            // FL cannot be told to load a project file from a script.
+            load_snapshot: false,
         }
     }
 
@@ -789,9 +916,11 @@ impl HostBridge for FlBridge {
                 }
             }
         }
+        self.maybe_quiet_save();
         self.pump_queue();
         std::mem::take(&mut self.out)
     }
+
 
     fn has_plugin(&self, plugin: &PluginIdentity) -> bool {
         // Same-name plugin somewhere in this project. Real identity matching
@@ -800,13 +929,13 @@ impl HostBridge for FlBridge {
             && (self.tracks.values().any(|t| t.slots.values().any(|s| s.plugin == plugin.name)) || self.channels.values().any(|c| c.plugin.as_deref() == Some(plugin.name.as_str())))
     }
 
-    fn set_param(&mut self, lane: &LaneId, slot: DeviceSlot, plugin: &PluginIdentity, param: &ParamId, value: f32) -> ApplyOutcome {
+    fn set_param(&mut self, track: &TrackId, slot: DeviceSlot, plugin: &PluginIdentity, param: &ParamId, value: f32) -> ApplyOutcome {
         let Ok(p) = param.0.parse::<u32>() else { return ApplyOutcome::NotAvailable };
         if !self.has_plugin(plugin) {
             return ApplyOutcome::NotAvailable;
         }
-        if let Some(chan) = Self::channel_for_lane(lane) {
-            // the generator: slot 0 of the channel lane = FL slot -1
+        if let Some(chan) = Self::channel_for_track(track) {
+            // the generator: slot 0 of the channel track = FL slot -1
             if slot.0 != 0 {
                 return ApplyOutcome::NotAvailable;
             }
@@ -817,22 +946,22 @@ impl HostBridge for FlBridge {
             self.queue.push_back(FlRequest::SetParam { track: chan, slot: -1, param: p, value: value.clamp(0.0, 1.0) });
             return ApplyOutcome::Applied;
         }
-        let Some(track) = Self::track_for_lane(lane) else { return ApplyOutcome::NotAvailable };
-        self.suppress.insert((track, slot.0 as i32, p), value);
-        if let Some(ss) = self.tracks.get_mut(&track).and_then(|t| t.slots.get_mut(&(slot.0 as i32))) {
+        let Some(index) = Self::index_for_track(track) else { return ApplyOutcome::NotAvailable };
+        self.suppress.insert((index, slot.0 as i32, p), value);
+        if let Some(ss) = self.tracks.get_mut(&index).and_then(|t| t.slots.get_mut(&(slot.0 as i32))) {
             if let Some(e) = ss.params.get_mut(&p) {
                 e.1 = value;
             }
         }
-        self.queue.push_back(FlRequest::SetParam { track, slot: slot.0 as i32, param: p, value: value.clamp(0.0, 1.0) });
+        self.queue.push_back(FlRequest::SetParam { track: index, slot: slot.0 as i32, param: p, value: value.clamp(0.0, 1.0) });
         ApplyOutcome::Applied
     }
 
-    fn set_device(&mut self, lane: &LaneId, slot: DeviceSlot, plugin: Option<&PluginIdentity>) -> ApplyOutcome {
+    fn set_device(&mut self, track: &TrackId, slot: DeviceSlot, plugin: Option<&PluginIdentity>) -> ApplyOutcome {
         // FL's API cannot load or delete plugins. What it can do is switch a
         // mixer effect slot off: "removed" becomes bypassed (with a notice),
         // "back again" re-enables it. Anything else is a step for the user.
-        if let Some(chan) = Self::channel_for_lane(lane) {
+        if let Some(chan) = Self::channel_for_track(track) {
             if slot.0 != 0 {
                 return ApplyOutcome::NotAvailable;
             }
@@ -843,39 +972,39 @@ impl HostBridge for FlBridge {
                 _ => ApplyOutcome::Unsupported,
             };
         }
-        let Some(track) = Self::track_for_lane(lane) else { return ApplyOutcome::NotAvailable };
+        let Some(index) = Self::index_for_track(track) else { return ApplyOutcome::NotAvailable };
         let s = slot.0 as i32;
-        let (have, bypassed) = self.tracks.get(&track).and_then(|t| t.slots.get(&s)).map(|x| (Some(x.plugin.clone()), x.bypassed)).unwrap_or((None, false));
+        let (have, bypassed) = self.tracks.get(&index).and_then(|t| t.slots.get(&s)).map(|x| (Some(x.plugin.clone()), x.bypassed)).unwrap_or((None, false));
         let slot_no = slot.0 + 1;
         match (have, plugin) {
             (None, None) => ApplyOutcome::Applied,
             (Some(h), Some(p)) if h == p.name => {
                 if bypassed {
-                    self.queue.push_back(FlRequest::SetSlotEnabled { track, slot: s, value: true });
-                    if let Some(x) = self.tracks.get_mut(&track).and_then(|t| t.slots.get_mut(&s)) {
+                    self.queue.push_back(FlRequest::SetSlotEnabled { track: index, slot: s, value: true });
+                    if let Some(x) = self.tracks.get_mut(&index).and_then(|t| t.slots.get_mut(&s)) {
                         x.bypassed = false;
                     }
-                    self.out.push(HostEvent::Notice(format!("{lane}: {h} in slot {slot_no} is on again")));
+                    self.out.push(HostEvent::Notice(format!("{track}: {h} in slot {slot_no} is on again")));
                 }
                 ApplyOutcome::Applied
             }
             (Some(h), None) => {
                 if !bypassed {
-                    self.queue.push_back(FlRequest::SetSlotEnabled { track, slot: s, value: false });
-                    if let Some(x) = self.tracks.get_mut(&track).and_then(|t| t.slots.get_mut(&s)) {
+                    self.queue.push_back(FlRequest::SetSlotEnabled { track: index, slot: s, value: false });
+                    if let Some(x) = self.tracks.get_mut(&index).and_then(|t| t.slots.get_mut(&s)) {
                         x.bypassed = true;
                     }
-                    self.out.push(HostEvent::Notice(format!("{lane}: {h} in slot {slot_no} switched off (FL can't delete plugins from outside; remove it yourself if you want it gone)")));
+                    self.out.push(HostEvent::Notice(format!("{track}: {h} in slot {slot_no} switched off (FL can't delete plugins from outside; remove it yourself if you want it gone)")));
                 }
                 ApplyOutcome::Applied
             }
             (Some(h), Some(p)) => {
                 if !bypassed {
-                    self.queue.push_back(FlRequest::SetSlotEnabled { track, slot: s, value: false });
-                    if let Some(x) = self.tracks.get_mut(&track).and_then(|t| t.slots.get_mut(&s)) {
+                    self.queue.push_back(FlRequest::SetSlotEnabled { track: index, slot: s, value: false });
+                    if let Some(x) = self.tracks.get_mut(&index).and_then(|t| t.slots.get_mut(&s)) {
                         x.bypassed = true;
                     }
-                    self.out.push(HostEvent::Notice(format!("{lane}: {h} in slot {slot_no} switched off; this moment had {} there", p.name)));
+                    self.out.push(HostEvent::Notice(format!("{track}: {h} in slot {slot_no} switched off; this moment had {} there", p.name)));
                 }
                 ApplyOutcome::Unsupported
             }
@@ -883,8 +1012,8 @@ impl HostBridge for FlBridge {
         }
     }
 
-    fn set_mixer(&mut self, lane: &LaneId, change: &MixerChange) -> ApplyOutcome {
-        if let Some(chan) = Self::channel_for_lane(lane) {
+    fn set_mixer(&mut self, track: &TrackId, change: &MixerChange) -> ApplyOutcome {
+        if let Some(chan) = Self::channel_for_track(track) {
             let cs = self.channels.entry(chan).or_default();
             match change {
                 MixerChange::Volume(g) => {
@@ -902,20 +1031,20 @@ impl HostBridge for FlBridge {
             }
             return ApplyOutcome::Applied;
         }
-        let Some(track) = Self::track_for_lane(lane) else { return ApplyOutcome::NotAvailable };
-        let st = self.tracks.entry(track).or_default();
+        let Some(index) = Self::index_for_track(track) else { return ApplyOutcome::NotAvailable };
+        let st = self.tracks.entry(index).or_default();
         match change {
             MixerChange::Volume(g) => {
                 st.volume = gain_to_fl(*g);
-                self.queue.push_back(FlRequest::SetVolume { track, value: st.volume });
+                self.queue.push_back(FlRequest::SetVolume { track: index, value: st.volume });
             }
             MixerChange::Pan(p) => {
                 st.pan = *p;
-                self.queue.push_back(FlRequest::SetPan { track, value: *p });
+                self.queue.push_back(FlRequest::SetPan { track: index, value: *p });
             }
             MixerChange::Mute(m) => {
                 st.mute = *m;
-                self.queue.push_back(FlRequest::SetMute { track, value: *m });
+                self.queue.push_back(FlRequest::SetMute { track: index, value: *m });
             }
         }
         ApplyOutcome::Applied
@@ -948,17 +1077,23 @@ impl HostBridge for FlBridge {
         crate::flp::read_project(&python, path).ok()
     }
 
-    fn render_lane(&mut self, _lane: &LaneId, _from: SongPos, _to: SongPos) -> Option<RenderedAudio> {
+    fn render_track(&mut self, _track: &TrackId, _from: SongPos, _to: SongPos) -> Option<RenderedAudio> {
         None
     }
 
-    fn lanes(&self) -> Vec<LaneId> {
-        self.tracks.keys().map(|t| Self::lane_for_track(*t)).chain(self.channels.keys().map(|c| Self::lane_for_channel(*c))).collect()
+    fn tracks(&self) -> Vec<TrackId> {
+        self.tracks.keys().map(|t| Self::track_for_index(*t)).chain(self.channels.keys().map(|c| Self::track_for_channel(*c))).collect()
     }
 
     fn request_save(&mut self) -> ApplyOutcome {
-        // FL saves itself; the heartbeat's changed flag then reports the
+        // Presence tints must never end up in the file: restore first. FL
+        // saves itself; the heartbeat's changed flag then reports the
         // written file (Save As dialog when the project is untitled).
+        self.restore_colors();
+        // An asked-for save covers pending notes edits and makes a Version.
+        self.notes_dirty = None;
+        self.quiet_save_sent = false;
+        self.version_save_at = Some(Instant::now());
         self.queue.push_back(FlRequest::Save);
         ApplyOutcome::Applied
     }
@@ -984,7 +1119,7 @@ impl HostBridge for FlBridge {
         } else if self.script.is_some() {
             "script went quiet (no heartbeat for 3 s)".to_string()
         } else {
-            "waiting for the FL script: Options > MIDI Settings, Input list: 'FLit In' enabled, Controller type 'FLit (user)', any port number; Output list: 'FLit Out' enabled with the SAME port number; then View > Script output > FLit should say 'init ok'".to_string()
+            format!("waiting for the FL script: Options > MIDI Settings, Input list: '{p} In' enabled, Controller type 'FLit (user)', any port number; Output list: '{p} Out' enabled with the SAME port number; then View > Script output > FLit should say 'init ok'", p = self.cfg.port)
         };
         let hb = self.last_heartbeat.map(|t| format!("{:.1}s ago", t.elapsed().as_secs_f32())).unwrap_or_else(|| "never".into());
         format!("{ver}{link}; {} tracks, {} channels seen; title \"{}\"; last heartbeat {hb}", self.tracks.len(), self.channels.len(), self.title)
@@ -992,5 +1127,90 @@ impl HostBridge for FlBridge {
 
     fn link_up(&self) -> Option<bool> {
         Some(self.is_connected())
+    }
+
+    fn show_presence(&mut self, shown: &[Shown]) -> ApplyOutcome {
+        // one tint per track: the first visitor on it
+        let mut want_tracks: BTreeMap<i32, u32> = BTreeMap::new();
+        let mut want_chans: BTreeMap<i32, u32> = BTreeMap::new();
+        for s in shown {
+            let Some(t) = &s.presence.track else { continue };
+            if let Some(i) = Self::index_for_track(t) {
+                want_tracks.entry(i).or_insert(s.color);
+            } else if let Some(c) = Self::channel_for_track(t) {
+                want_chans.entry(c).or_insert(s.color);
+            }
+        }
+        // restore what is no longer wanted
+        let gone: Vec<i32> = self.tinted_tracks.keys().filter(|t| !want_tracks.contains_key(t)).copied().collect();
+        for t in gone {
+            if let Some(c) = self.tinted_tracks.remove(&t) {
+                self.queue.push_back(FlRequest::SetTrackColor { track: t, color: c });
+            }
+        }
+        let gone: Vec<i32> = self.tinted_channels.keys().filter(|c| !want_chans.contains_key(c)).copied().collect();
+        for c in gone {
+            if let Some(col) = self.tinted_channels.remove(&c) {
+                self.queue.push_back(FlRequest::SetChannelColor { chan: c, color: col });
+            }
+        }
+        for (t, color) in want_tracks {
+            let original = self.tracks.get(&t).map(|x| x.color).unwrap_or(0);
+            self.tinted_tracks.entry(t).or_insert(original);
+            self.queue.push_back(FlRequest::SetTrackColor { track: t, color });
+        }
+        for (c, color) in want_chans {
+            let original = self.channels.get(&c).map(|x| x.color).unwrap_or(0);
+            self.tinted_channels.entry(c).or_insert(original);
+            self.queue.push_back(FlRequest::SetChannelColor { chan: c, color });
+        }
+        ApplyOutcome::Applied
+    }
+
+    fn clear_presence(&mut self) {
+        self.restore_colors();
+    }
+
+    fn follow(&mut self, presence: &PresencePayload) -> ApplyOutcome {
+        if let Some(t) = &presence.track {
+            if let Some(i) = Self::index_for_track(t) {
+                self.queue.push_back(FlRequest::SelectTrack { track: i });
+            } else if let Some(c) = Self::channel_for_track(t) {
+                self.queue.push_back(FlRequest::SelectChannel { chan: c });
+            }
+        }
+        let window = match presence.view {
+            View::Mixer => Some("mixer"),
+            View::Notes => Some("piano_roll"),
+            View::Arrange => Some("playlist"),
+            View::Browser => Some("browser"),
+            View::Device => None,
+            View::Other => presence.region.as_deref().filter(|r| *r == "channel rack").map(|_| "channel_rack"),
+        };
+        if let Some(w) = window {
+            self.queue.push_back(FlRequest::ShowWindow { window: w.into() });
+        }
+        ApplyOutcome::Applied
+    }
+
+    fn read_state(&mut self) -> Option<HostModel> {
+        let mut m = HostModel { tempo: Some(self.tempo), tracks: BTreeMap::new() };
+        for (i, t) in &self.tracks {
+            let devices = t
+                .slots
+                .iter()
+                .filter(|(s, _)| **s >= 0)
+                .map(|(s, ss)| (DeviceSlot(*s as u32), HostDevice { plugin: Self::plugin_identity(&ss.plugin), params: ss.params.iter().map(|(p, (_, v))| (ParamId::from_u32(*p), *v)).collect() }))
+                .collect();
+            m.tracks.insert(Self::track_for_index(*i), HostTrack { devices, volume: Some(fl_to_gain(t.volume)), pan: Some(t.pan), mute: Some(t.mute), host_state: None });
+        }
+        for (c, cs) in &self.channels {
+            let mut devices = BTreeMap::new();
+            if let Some(p) = &cs.plugin {
+                devices.insert(DeviceSlot(0), HostDevice { plugin: Self::plugin_identity(p), params: cs.slot.params.iter().map(|(p, (_, v))| (ParamId::from_u32(*p), *v)).collect() });
+            }
+            m.tracks.insert(Self::track_for_channel(*c), HostTrack { devices, volume: Some(chan_to_gain(cs.volume)), pan: Some(cs.pan), mute: Some(cs.mute), host_state: None });
+        }
+        Some(m)
     }
 }

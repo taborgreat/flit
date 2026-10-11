@@ -1,0 +1,19 @@
+[package]
+name = "flit-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FLit's shared UI: theme tokens, fonts, widgets, the screens and the client state they read. Used by the app window and the plugin panel so they always match."
+
+[dependencies]
+flit-core.workspace = true
+flit-ipc.workspace = true
+# Same egui nih_plug_egui pins (one egui in the tree, or the plugin's
+# context and ours would be different types).
+egui = "0.31.1"
+parking_lot.workspace = true
+atomic_float.workspace = true
+qrcode.workspace = true
+arboard.workspace = true
+image.workspace = true

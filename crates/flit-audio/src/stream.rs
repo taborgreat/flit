@@ -4,7 +4,7 @@
 
 use crate::resample::resample;
 use crate::{opus_err, Result};
-use flit_core::LaneId;
+use flit_core::TrackId;
 use opusic_c::{Application, Bitrate, Channels, Decoder, Encoder, SampleRate};
 use serde::{Deserialize, Serialize};
 
@@ -13,8 +13,8 @@ const MAX_PACKET: usize = 4000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StreamKind {
-    /// A lane of the song (or the owner's lanes as one submix).
-    InSong { lane: LaneId },
+    /// A track of the song (or my tracks as one submix).
+    InSong { track: TrackId },
     /// My lanes mixed to one stream, for listeners who don't need them apart.
     Submix,
     /// The mix owner's master output: the reference mix.
@@ -44,8 +44,8 @@ pub struct StreamConfig {
 }
 
 impl StreamConfig {
-    pub fn lane(lane: &LaneId, sample_rate: u32, channels: u8) -> Self {
-        Self { kind: StreamKind::InSong { lane: lane.clone() }, channels, bitrate: 128_000, low_delay: false, sample_rate }
+    pub fn track(track: &TrackId, sample_rate: u32, channels: u8) -> Self {
+        Self { kind: StreamKind::InSong { track: track.clone() }, channels, bitrate: 128_000, low_delay: false, sample_rate }
     }
 
     pub fn talk(name: &str, sample_rate: u32, channels: u8) -> Self {
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn lane_stream_roundtrip_with_loss() {
-        let cfg = StreamConfig::lane(&LaneId::new("gtr"), 48_000, 2);
+        let cfg = StreamConfig::track(&TrackId::new("gtr"), 48_000, 2);
         let mut enc = StreamEncoder::new(cfg.clone()).unwrap();
         let mut dec = StreamDecoder::new(cfg).unwrap();
         let pcm = tone(48_000, 48_000, 2);
@@ -262,7 +262,7 @@ mod tests {
         let out: Vec<f32> = pkts.iter().flat_map(|p| dec.decode(p).unwrap()).collect();
         assert!((out.len() as i64 - 4410).abs() <= 10);
         assert!(enc.latency_frames() < 48 * 20, "under 20 ms of codec delay");
-        assert!(StreamConfig::lane(&LaneId::new("x"), 48_000, 2).kind.in_song());
+        assert!(StreamConfig::track(&TrackId::new("x"), 48_000, 2).kind.in_song());
     }
 
     #[test]

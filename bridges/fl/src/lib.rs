@@ -3,8 +3,8 @@
 //! How it works (see RESEARCH.md for sources):
 //! - FL only lets third-party code in through a MIDI controller script
 //!   (`fl-script/device_FLit.py`). The script has no sockets, threads or
-//!   file writes, so the agent talks to it with SysEx over a loopback MIDI
-//!   port (loopMIDI on Windows).
+//!   file writes, so the app talks to it with SysEx over a virtual MIDI
+//!   port. The port is only a wire; everything about it is `port.rs`.
 //! - Wire format: `F0 7D 'F' 'L' 'i' 't' dir id_hi id_lo cont base64(json) F7`,
 //!   chunked at 600 bytes of payload (Windows drops SysEx over ~1 KB).
 //! - FL reports no per-parameter change events, only "dirty" flags. The
@@ -17,11 +17,11 @@
 
 pub mod bridge;
 pub mod flp;
-pub mod midi;
+pub mod port;
 pub mod sysex;
 
 pub use bridge::{FlBridge, FlConfig};
-pub use midi::{LoopbackPort, MidiPort};
+pub use port::{HostPort, LoopbackPort, MidiPort, PortError, Wire};
 pub use sysex::{Chunker, FlEvent, FlReply, FlRequest, Frame, Dir};
 
 /// Host tag written into events produced through this bridge.

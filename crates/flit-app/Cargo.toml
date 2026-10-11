@@ -1,0 +1,30 @@
+[package]
+name = "flit-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FLit: the standalone app. The helper (spines, keeper, sync, bridges) with its own window; the plugin is a thin connector to it."
+
+[[bin]]
+name = "flit-app"
+path = "src/main.rs"
+
+[dependencies]
+flit-agent.workspace = true
+flit-ipc.workspace = true
+flit-core.workspace = true
+flit-ui.workspace = true
+eframe.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+clap.workspace = true
+image.workspace = true
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# The tray icon (PACK 2 §8.3): the way back to a hidden window. Linux's
+# appindicator feature is off; macOS/Linux trays are untested.
+tray-icon = { version = "0.26", default-features = false }

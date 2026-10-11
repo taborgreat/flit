@@ -6,6 +6,97 @@ Two sessions so far. **Part A** (top) is session 2: Windows, FL Studio 24.1.1,
 Where Part B says `Event`/`Log`/`events.jsonl`, Part A's W6 is the truth
 now: the core runs the TreeOS act model (`Stamp`, act chains, fact chains).
 Nothing is committed: that is Tabor's job.
+Words users see (Studio, member, moment, org, album) and the dead-word list: FLIT_SPEC.md section 0. Code names stay.
+
+# Part A2 — the UPDATE PACK (2026-10-10/11). READ THIS FIRST; it supersedes parts of A0..A11 and Part B
+
+`update.md` (pack 1, sections 0 to 24) was applied across every crate. `FLIT_SPEC.md` is now the spec, with a
+table of where each section lives and what is not built. Everything below in this file describing lanes, lane
+owners, branches, Bring in, stamps or `.flit/stamps` is history.
+
+## A12.0 State
+- `cargo test --workspace`: **94 Rust tests, 0 failed**. Script: `cd bridges/fl/fl-script && python -m unittest
+  test_device_flit` (10 tests; do not pass `-I`, it hides the folder).
+- **Nothing of the pack has been run inside FL Studio yet.**
+- Old songs do not open: a `.flit` folder with `stamps/` is refused. Make the song again.
+- The old `identity.key` is adopted as the first Name, unnamed: the panel opens on the first-run walk.
+
+## A12.1 The model in one paragraph
+A Name (one key) holds authority; its beings (human, ai, scripted) stamp acts onto their own act chain per
+history (`act_seq`). The song's keeper (by default the owner's machine; a `Keeper` act moves it) seals each act
+into a fact on the touched thing's chain (`fact_seq`) and the history's seal order (`seal_seq`). Peers apply acts
+at once and mark them sealed when the fact arrives. Same property changed by two beings before either saw the
+other: first sealed wins, the other is sealed into a new history named after the being and the property. No
+clock is read anywhere in ordering (`flit-core/tests/lint.rs`).
+
+## A12.2 Where things are
+- Core: `crates/flit-core/src/{act,beings,crew,state,names,clock,song}.rs`, `seal/{mod,verify,fold,keeper,spine,lens}.rs`.
+  Disk: `.flit/format`, `.flit/spines/<name-hex>.tree`, `.flit/spines/keeper.tree`, `.flit/blobs`, `.flit/sidecar`.
+- Host: `crates/flit-host/src/bridge.rs` (trait, `HostModel`, `diff`, presence), `live.rs` (settle, presence
+  settle, `Receiver::apply_state` = diff or snapshot path).
+- Net: `SyncMsg::{Hello{heads}, Act, Moment, Want, After}`; `Node::publish()` sends what `Song::take_outbox()` queued.
+- Agent: Names under `<data>/names/<hex>/{secret,profile.json}`; keeper claimed when the song names this Name
+  and machine (`<data>/machine`); presence pushed every 500 ms; `updates.rs`.
+- IPC: protocol 2 (`crates/flit-ipc/src/proto.rs`). A plugin built before the pack cannot talk to this agent.
+- Plugin: `theme.rs` (tokens, Plex fonts in `assets/fonts`), `ui.rs` (top bar, rail, Timeline bar, status strip,
+  Merge dialog), `ui/tutorial.rs` (first run and Help; written by a second session, ported to the new backend),
+  `ui/help.rs` (concept list, second tab of Help).
+- FL: tracks are `fl-track-N` (0 = master) and `fl-channel-N`; the `mix` id is gone. Script gained `focus`
+  events and `set_track_color`, `set_channel_color`, `select_track`, `select_channel`, `show_window`.
+
+## A12.3 VERIFY ON WINDOWS, new with the pack (none checked yet)
+1. `mixer.setTrackColor` / `channels.setChannelColor`: colour format (0xRRGGBB assumed) and whether tinting
+   flips FL's "changed" flag (it would look like an edit and could mask a real save). If it does, turn the
+   setting off by default.
+2. A save started inside FL (Ctrl+S) while tracks are tinted writes the tint into the `.flp`. Only saves asked
+   for from the panel restore colours first.
+3. `mixer.trackNumber`, `channels.selectedChannel`, `mixer.setTrackNumber`, `channels.selectOneChannel`,
+   `ui.showWindow`: exist and behave on API v37.
+4. The focus poll in `OnIdle` (~200 ms): cost on a big project.
+5. Show in DAW (click a moment on the tape): the read-only look, and coming back with Live.
+6. Pack section 20: FL cannot add/remove plugins or restore state chunks from a script (known); cost of many
+   applies in a row.
+7. Pack section 16: printing a track post-fader pre-send without rerouting.
+
+## A12.4 Not built (also listed in FLIT_SPEC.md)
+Listen scrub and the Listen buttons; activity view and its signals; waveform/curve overlays and "Keep both" in
+Merge; QR pairing for a delegated being; OS keychain for Name keys; icon set and UI scale; signed releases and
+side-by-side installs; host-neutral track ids. PACK 2 (orgs, albums, shelf, standalone app) is untouched.
+
+## A12.5 Build and install
+Same commands as A5. `tools/install/install-windows.ps1` builds release (flit-app, flit-agent, fake-session, the
+plugin), bundles the plugin and copies app, agent, CLI, script and per-user plugin. The system VST3/CLAP copy needs
+`-SystemPlugins` (one UAC prompt) with FL closed; the running helper must be stopped first (it locks its exe).
+
+## A12.6 PACK 2 (2026-10-11), see FLIT_SPEC.md "PACK 2 as built"
+- `crates/flit-ui`: theme + fonts + widgets, `client.rs` (Shared and the IPC pump), `host.rs`, `panel.rs` and
+  `panel/{tutorial,help,library}.rs`. Both the app window and the plugin draw it.
+- `crates/flit-app`: FLit the app. Helper on a tokio thread + eframe window as an IPC client of its own helper
+  (`ClientKind::Window`). `--background` (window on demand), `--headless`. Second launch -> `Request::OpenWindow`
+  -> the window comes forward (native ShowWindow: a hidden eframe window gets no repaints). Close = hide; the
+  tray icon (`tray.rs`: Open FLit / Quit FLit, left click opens) and the plugin's [Open FLit] bring it back.
+- IPC protocol 4. `Request::OpenWindow { song, spawn }`, `Push::OpenWindow`, `Push::Invite { kind }`, the Library
+  requests and rows (`LibraryView`, `OrgRow`, `OrgMemberRow`, `AlbumRow`, `InviteRow`). Status/SongStatus unchanged.
+- Core: `org.rs`; containers of kind Song | Org | Personal share one `Song` type and one `Chains`; the kind is in
+  the genesis act's `property`. Net: `Node.containers` beside the open song; sessions are per (peer, container).
+- Agent: orgs under `<data>/orgs/<hex>/`, the personal shelf under `<data>/names/<hex>/personal/`, keeper claimed
+  per container, `registry.song_notes` (id/org/access per song folder) feeds the Library.
+- FL crash on plugin removal / project switch (FLit.clap_unloaded, c0000405): the IPC reader thread outlived the
+  DLL. `flit_ipc::Client::drop` now cancels the pipe read (CancelIoEx) and joins; test
+  `dropping_a_client_ends_its_reader_thread`.
+- Old pre-pack `.flit` beside a project: moved aside to `.flit-before-spines` by `Song::create`; not a song for
+  `Song::exists`; auto-link says a failure once.
+- Compact plugin (8.5): `flit-ui/src/compact.rs`; four modes (Track send/receive, Talk send/receive). An
+  instance named "master" is the session link: Track "master" sends the reference mix (`__reference`) and
+  transport; Receiver "master" hears the reference mix in place of the local mix (`Shared.master`, read by the
+  audio thread). Any Track instance reports transport; the helper stamps a change once. [Open FLit] =
+  `Request::OpenWindow { spawn: true }`. The compact panel never switches songs: it shows the DAW's current
+  project and offers "Make it a song" when that project is not one. VERIFY IN FL: typing in the compact panel
+  (keyboard workaround), the window size (520x230), [Open FLit] bringing the app forward from inside FL.
+- The app opens the DAW: `Request::OpenInDaw { dir }` opens the song and its project file with the OS default
+  app (FL for .flp); without a project it starts the newest `Program Files\Image-Line\FL Studio *\FL64.exe`
+  (`FLIT_DAW` overrides). Library: "Open in FL Studio" per song, "Create and open FL Studio" on New song.
+  VERIFY IN FL: FL already running when a second .flp is opened (FL's own prompt), the .flp association.
 
 # Part A — session 2 (Windows, FL Studio 24.1.1.4239)
 
@@ -188,6 +279,57 @@ Vocabulary in code: `Stamp` (`crates/flit-core/src/stamp.rs`), `Thing::{Song, La
 6. PyFLP helper: report the slot's `internal_name` when the plugin class is `_PluginBase`.
 7. `Id` vs `Name`: the addendum's word for an identity is Name; the type stays `Id`. Rename if wanted (touches
    every crate, the IPC and the panel).
+
+## A13. Notes and instruments reach the song (2026-10-11, tutorial session)
+
+Tabor added FL Keys and drew notes; neither showed up. Two causes, both fixed with tests:
+
+- **A channel that arrives with its instrument** (add FL Keys = new channel + generator in one step) only produced
+  `TrackSeen`; a Device act came only when a generator was *swapped*. The bridge now announces the generator of a new
+  channel and the plugins in the slots of a newly announced mixer track (`fold_channels`, the mixer `is_new` branch).
+  Core rule to go with it (`LiveLoop::tick`, `HostEvent::DeviceChanged`): a device is a moment only when it differs
+  from what the song has in that slot, so bridges may announce everything they see (first snapshot included) and the
+  song dedupes. `bridges/fake/tests/live_flow.rs::announcing_a_device_the_song_knows_is_not_a_moment`.
+- **Notes live only in the .flp.** FL's scripting API has no note read (RESEARCH.md); the only path is PyFLP on a
+  saved file, and that ran only inside Save version. Project_1.flp had not been written since 10-10 01:56, so nothing
+  could land. New, host-neutral: `HostEvent::NotesChanged { path, pos }` = "this file holds the current notes; sync
+  them, no Version" -> `LiveLoop::sync_notes` (the same `notes_from_project` that Save version uses: one Notes act
+  per clip with added/removed notes). FL bridge: an undo step while the piano roll or playlist is focused, or a stop
+  while the record button is on (new heartbeat field `recording`), marks notes dirty; after `FlConfig.notes_settle`
+  (3 s) with the transport stopped it asks FL to save (`FlRequest::Save`, tints restored first) and turns the next
+  "changed flag back to 0" into `NotesChanged` instead of `ProjectSaved`. Save version / the user's own save still
+  make a Version (`version_save_at` wins for 60 s). `FlConfig.quiet_save` (default on) turns it off; untitled
+  projects never get a quiet save (FL would open Save As). One notice tells the user the first time.
+  `bridges/fl/tests/bridge_flow.rs::notes_edits_make_a_quiet_save_and_notes_changed`.
+
+What this is NOT yet (PACK 3 in update.md): live MIDI as a stream while playing, one Notes act per take from the
+stream, scheduled MIDI back into the DAW. The take-as-one-act part already falls out of the file path: FL records a
+pass into a pattern, the stop triggers the quiet save, PyFLP reads the pattern, one Notes act per clip.
+
+VERIFY ON WINDOWS (needs FL running the new script + app):
+1. `transport.isRecording()` exists on API v37 and reports the record button (else `recording` is False and only
+   piano-roll/playlist undo steps trigger the sync).
+2. `ui.getFocused(widPianoRoll)` is true while drawing notes (the focus event says `piano_roll`); same for the playlist.
+3. `transport.globalTransport(FPT_Save, 1)` from the script saves silently when the project has a file name, and FL's
+   `getChangedFlag()` drops to 0 right after (the bridge also checks the file's mtime < 120 s).
+4. PyFLP on the FL 24.1.1 file: pattern notes map to `fl-channel-N` by `rack_channel` (`flit_flp.py`), note position
+   ticks at the file's PPQ (`flp.rs`). Notes drawn in the step sequencer have length 0.
+5. The panel shows one "notes" row per clip per pause, credited to the acting member, and a teammate's copy shows
+   it after sync. FL Keys add shows as a "plugin" row on `fl-channel-N`.
+Install: `tools\install\install-windows.ps1 -NoBuild` after a release build (the FL script was copied by hand to
+`Documents\Image-Line\FL Studio\Settings\Hardware\FLit\device_FLit.py` on 10-11; FL reloads it at start).
+
+## A14. The virtual MIDI port is behind one trait (2026-10-11)
+
+`bridges/fl/src/port.rs` replaces `midi.rs`: `HostPort { open(name), send(bytes), on_receive(cb), close() }` is
+the only place platform MIDI code lives; `LoopMidiPort` (midir over winmm, the loopMIDI pair "FLit In" / "FLit
+Out" made by hand) is its dev-build implementation; `Wire` turns a `HostPort` into the `MidiPort` the bridge polls.
+`FlConfig.port` ("FLit") replaces `in_port` / `out_port`. **loopMIDI is dev-only; it is replaced at M6** (macOS
+`CoreMidiPort`, Windows `WinMidiServicesPort` with bundled teVirtualMIDI as fallback: the app creates the "FLit"
+port itself; FL's MIDI settings then need one click). FLIT_SPEC.md section 25 has the plan and the VERIFY list.
+Nothing outside `port.rs` says loopMIDI any more except the dev installer step (marked DEV ONLY) and the docs.
+The messages on the wire are unchanged (`sysex.rs` frames); carrying ACT / MOMENT verbs on it (spec section 21)
+is a separate step.
 
 # Part B — session 1 (Linux, FakeHost), as handed to session 2
 

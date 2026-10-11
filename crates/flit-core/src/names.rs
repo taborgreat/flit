@@ -196,6 +196,14 @@ impl NameStore {
         Ok(key)
     }
 
+    /// Give the Name its label (first run: the tutorial names it).
+    pub fn set_label(&self, id: &Id, label: &str) -> crate::Result<NameProfile> {
+        let mut p = self.profile(id)?;
+        p.label = label.trim().to_string();
+        self.save_profile(&p)?;
+        Ok(p)
+    }
+
     pub fn add_being(&self, id: &Id, being: BeingProfile) -> crate::Result<NameProfile> {
         let mut p = self.profile(id)?;
         if p.being(&being.id).is_some() {
